@@ -44,6 +44,22 @@ const TEXT_EXTENSIONS = new Set([
   '.env',
 ]);
 
+export interface WorkspaceImportMeta {
+  method: 'git-clone' | 'github-rest' | 'local-copy' | 'custom-write' | 'demo';
+  partial?: boolean;
+  note?: string;
+  filesFetched?: number;
+  filesCapped?: boolean;
+  dependencyInstall?: {
+    attempted: boolean;
+    packageManager?: 'npm' | 'pnpm' | 'yarn' | 'bun';
+    command?: string;
+    success?: boolean;
+    exitCode?: number;
+    output?: string;
+  };
+}
+
 export interface ActiveWorkspaceMeta {
   workspaceId: string;
   dir: string;
@@ -52,6 +68,7 @@ export interface ActiveWorkspaceMeta {
   sourceType: 'github' | 'workspace' | 'custom' | 'demo';
   branch: string;
   createdAt: number;
+  importMeta?: WorkspaceImportMeta;
 }
 
 const activeWorkspaces = new Map<string, ActiveWorkspaceMeta>();
@@ -209,12 +226,108 @@ export async function readAllTextFiles(dir: string): Promise<{
   return { files, fileContents };
 }
 
+type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';
+
+async function detectPackageManager(workspaceDir: string): Promise<PackageManager | null> {
+  const checks: Array<[PackageManager, string[]]> = [
+    ['pnpm', ['pnpm-lock.yaml']],
+    ['yarn', ['yarn.lock']],
+    ['bun', ['bun.lockb', 'bun.lock']],
+    ['npm', ['package-lock.json', 'npm-shrinkwrap.json']],
+  ];
+  for (const [pm, lockfiles] of checks) {
+    for (const lf of lockfiles) {
+      try {
+        await fs.access(path.join(workspaceDir, lf));
+        return pm;
+      } catch {
+        // continue
+      }
+    }
+  }
+  try {
+    await fs.access(path.join(workspaceDir, 'package.json'));
+    return 'npm';
+  } catch {
+    return null;
+  }
+}
+
+function installCommandForPackageManager(pm: PackageManager): { cmd: string; args: string[]; label: string } {
+  switch (pm) {
+    case 'pnpm':
+      return { cmd: 'pnpm', args: ['install', '--ignore-scripts', '--frozen-lockfile=false'], label: 'pnpm install --ignore-scripts' };
+    case 'yarn':
+      return { cmd: 'yarn', args: ['install', '--ignore-scripts'], label: 'yarn install --ignore-scripts' };
+    case 'bun':
+      return { cmd: 'bun', args: ['install', '--ignore-scripts'], label: 'bun install --ignore-scripts' };
+    case 'npm':
+    default:
+      return { cmd: 'npm', args: ['install', '--ignore-scripts', '--no-audit', '--no-fund'], label: 'npm install --ignore-scripts --no-audit --no-fund' };
+  }
+}
+
+async function bootstrapDependenciesIfNeeded(
+  workspaceDir: string
+): Promise<NonNullable<WorkspaceImportMeta['dependencyInstall']>> {
+  let hasPackageJson = false;
+  try {
+    await fs.access(path.join(workspaceDir, 'package.json'));
+    hasPackageJson = true;
+  } catch {
+    hasPackageJson = false;
+  }
+  if (!hasPackageJson) {
+    return { attempted: false, output: 'No package.json; dependency install skipped.' };
+  }
+  try {
+    await fs.access(path.join(workspaceDir, 'node_modules'));
+    return { attempted: false, output: 'node_modules already present; dependency install skipped.' };
+  } catch {
+    // proceed
+  }
+
+  const pm = await detectPackageManager(workspaceDir);
+  if (!pm) {
+    return { attempted: false, output: 'Could not detect package manager; dependency install skipped.' };
+  }
+  const spec = installCommandForPackageManager(pm);
+  try {
+    const { stdout, stderr } = await execFileAsync(spec.cmd, spec.args, {
+      cwd: workspaceDir,
+      timeout: 120_000,
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, CI: '1', npm_config_ignore_scripts: 'true' },
+    });
+    const output = [stdout, stderr].filter(Boolean).join('\n').trim().slice(0, 4000) || '(no output)';
+    return {
+      attempted: true,
+      packageManager: pm,
+      command: spec.label,
+      success: true,
+      exitCode: 0,
+      output,
+    };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; code?: number; message?: string };
+    const output = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim().slice(0, 4000) || 'Install failed.';
+    return {
+      attempted: true,
+      packageManager: pm,
+      command: spec.label,
+      success: false,
+      exitCode: typeof e.code === 'number' ? e.code : 1,
+      output,
+    };
+  }
+}
+
 async function fetchViaGitHubRestFallback(
   owner: string,
   repo: string,
   targetDir: string,
   preferredBranch?: string
-): Promise<string> {
+): Promise<{ branch: string; importMeta: WorkspaceImportMeta }> {
   const repoResp = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
     headers: { 'User-Agent': 'swarm-ide-debugger', Accept: 'application/vnd.github+json' },
   });
@@ -237,15 +350,15 @@ async function fetchViaGitHubRestFallback(
     tree?: Array<{ path: string; type: string; size?: number }>;
   };
 
-  const candidates = (treeJson.tree ?? [])
-    .filter(
-      (item) =>
-        item.type === 'blob' &&
-        (item.size ?? 0) < 260_000 &&
-        TEXT_EXTENSIONS.has(path.extname(item.path).toLowerCase()) &&
-        !/\.min\.(js|css)$/i.test(item.path) &&
-        !item.path.split('/').some((seg) => IGNORED_DIRS.has(seg))
-    )
+  const filtered = (treeJson.tree ?? []).filter(
+    (item) =>
+      item.type === 'blob' &&
+      (item.size ?? 0) < 260_000 &&
+      TEXT_EXTENSIONS.has(path.extname(item.path).toLowerCase()) &&
+      !/\.min\.(js|css)$/i.test(item.path) &&
+      !item.path.split('/').some((seg) => IGNORED_DIRS.has(seg))
+  );
+  const candidates = filtered
     .sort((a, b) => {
       const aSrc = /^(src|lib|server|app|packages|package\.json|tsconfig\.json)/i.test(a.path) ? 0 : 1;
       const bSrc = /^(src|lib|server|app|packages|package\.json|tsconfig\.json)/i.test(b.path) ? 0 : 1;
@@ -253,32 +366,46 @@ async function fetchViaGitHubRestFallback(
     })
     .slice(0, 240);
 
+  let filesFetched = 0;
   for (let i = 0; i < candidates.length; i += 20) {
     const batch = candidates.slice(i, i + 20);
-    await Promise.all(
+    const results = await Promise.all(
       batch.map(async (item) => {
         const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(branch)}/${item.path}`;
         const res = await fetch(rawUrl);
-        if (!res.ok) return;
+        if (!res.ok) return false;
         const text = await res.text();
         const dest = path.resolve(targetDir, item.path);
-        if (!dest.startsWith(targetDir + path.sep)) return;
+        if (!dest.startsWith(targetDir + path.sep)) return false;
         await fs.mkdir(path.dirname(dest), { recursive: true });
         await fs.writeFile(dest, text, 'utf-8');
+        return true;
       })
     );
+    filesFetched += results.filter(Boolean).length;
   }
 
-  return ensureGitBaseline(targetDir);
+  const baselineBranch = await ensureGitBaseline(targetDir);
+  return {
+    branch: baselineBranch,
+    importMeta: {
+      method: 'github-rest',
+      partial: true,
+      filesFetched,
+      filesCapped: filtered.length > candidates.length,
+      note: `REST fallback import (no git history); fetched ${filesFetched}/${candidates.length} selected text files${filtered.length > candidates.length ? `, capped from ${filtered.length}` : ''}.`,
+    },
+  };
 }
 
-export async function importGitHubWorkspace(rawUrl: string): Promise<WorkspaceSnapshot> {
+export async function importGitHubWorkspace(rawUrl: string): Promise<WorkspaceSnapshot & { importMeta?: WorkspaceImportMeta }> {
   const parsed = parseGitHubInput(rawUrl);
   const workspaceId = `gh-${parsed.repo}-${randomUUID().slice(0, 8)}`;
   const targetDir = path.join(WORKSPACES_ROOT, workspaceId);
   await fs.mkdir(WORKSPACES_ROOT, { recursive: true });
 
   let branch = parsed.branch || 'main';
+  let importMeta: WorkspaceImportMeta = { method: 'git-clone', note: 'Shallow git clone (depth=1).' };
   try {
     const cloneArgs = ['clone', '--depth', '1'];
     if (parsed.branch) {
@@ -297,13 +424,19 @@ export async function importGitHubWorkspace(rawUrl: string): Promise<WorkspaceSn
   } catch {
     await fs.rm(targetDir, { recursive: true, force: true });
     await fs.mkdir(targetDir, { recursive: true });
-    branch = await fetchViaGitHubRestFallback(
-      parsed.owner,
-      parsed.repo,
-      targetDir,
-      parsed.branch
-    );
+    const fallback = await fetchViaGitHubRestFallback(parsed.owner, parsed.repo, targetDir, parsed.branch);
+    branch = fallback.branch;
+    importMeta = fallback.importMeta;
   }
+
+  const dependencyInstall = await bootstrapDependenciesIfNeeded(targetDir);
+  importMeta = {
+    ...importMeta,
+    dependencyInstall,
+    note: [importMeta.note, dependencyInstall.attempted ? `Deps: ${dependencyInstall.command} (${dependencyInstall.success ? 'ok' : `failed${dependencyInstall.exitCode != null ? ` ${dependencyInstall.exitCode}` : ''}`})` : dependencyInstall.output]
+      .filter(Boolean)
+      .join(' '),
+  };
 
   const meta: ActiveWorkspaceMeta = {
     workspaceId,
@@ -313,6 +446,7 @@ export async function importGitHubWorkspace(rawUrl: string): Promise<WorkspaceSn
     sourceType: 'github',
     branch,
     createdAt: Date.now(),
+    importMeta,
   };
   activeWorkspaces.set(workspaceId, meta);
 
@@ -325,10 +459,11 @@ export async function importGitHubWorkspace(rawUrl: string): Promise<WorkspaceSn
     branch,
     files,
     fileContents,
+    importMeta,
   };
 }
 
-export async function importLocalWorkspace(projectRoot: string): Promise<WorkspaceSnapshot> {
+export async function importLocalWorkspace(projectRoot: string): Promise<WorkspaceSnapshot & { importMeta?: WorkspaceImportMeta }> {
   const workspaceId = `local-${randomUUID().slice(0, 8)}`;
   const targetDir = path.join(WORKSPACES_ROOT, workspaceId);
   await fs.mkdir(targetDir, { recursive: true });
@@ -348,6 +483,7 @@ export async function importLocalWorkspace(projectRoot: string): Promise<Workspa
   }
 
   const branch = await ensureGitBaseline(targetDir);
+  const importMeta: WorkspaceImportMeta = { method: 'local-copy', note: 'Copied selected local workspace files into isolated snapshot.' };
   const meta: ActiveWorkspaceMeta = {
     workspaceId,
     dir: targetDir,
@@ -356,6 +492,7 @@ export async function importLocalWorkspace(projectRoot: string): Promise<Workspa
     sourceType: 'workspace',
     branch,
     createdAt: Date.now(),
+    importMeta,
   };
   activeWorkspaces.set(workspaceId, meta);
 
@@ -368,13 +505,14 @@ export async function importLocalWorkspace(projectRoot: string): Promise<Workspa
     branch,
     files,
     fileContents,
+    importMeta,
   };
 }
 
 export async function importCustomFilesWorkspace(
   name: string,
   inputFiles: Array<{ path: string; content: string }>
-): Promise<WorkspaceSnapshot> {
+): Promise<WorkspaceSnapshot & { importMeta?: WorkspaceImportMeta }> {
   const workspaceId = `custom-${randomUUID().slice(0, 8)}`;
   const targetDir = path.join(WORKSPACES_ROOT, workspaceId);
   await fs.mkdir(targetDir, { recursive: true });
@@ -390,6 +528,7 @@ export async function importCustomFilesWorkspace(
   }
 
   const branch = await ensureGitBaseline(targetDir);
+  const importMeta: WorkspaceImportMeta = { method: 'custom-write', note: `Wrote ${inputFiles.length} uploaded files.` };
   const meta: ActiveWorkspaceMeta = {
     workspaceId,
     dir: targetDir,
@@ -398,6 +537,7 @@ export async function importCustomFilesWorkspace(
     sourceType: 'custom',
     branch,
     createdAt: Date.now(),
+    importMeta,
   };
   activeWorkspaces.set(workspaceId, meta);
 
@@ -410,10 +550,11 @@ export async function importCustomFilesWorkspace(
     branch,
     files,
     fileContents,
+    importMeta,
   };
 }
 
-export async function importBuggyDemoWorkspace(): Promise<WorkspaceSnapshot> {
+export async function importBuggyDemoWorkspace(): Promise<WorkspaceSnapshot & { importMeta?: WorkspaceImportMeta }> {
   const workspaceId = `demo-${randomUUID().slice(0, 8)}`;
   const targetDir = path.join(WORKSPACES_ROOT, workspaceId);
   await fs.mkdir(targetDir, { recursive: true });
@@ -516,6 +657,7 @@ export async function importBuggyDemoWorkspace(): Promise<WorkspaceSnapshot> {
   }
 
   const branch = await ensureGitBaseline(targetDir);
+  const importMeta: WorkspaceImportMeta = { method: 'demo', note: 'Generated local demo workspace.' };
   const meta: ActiveWorkspaceMeta = {
     workspaceId,
     dir: targetDir,
@@ -524,6 +666,7 @@ export async function importBuggyDemoWorkspace(): Promise<WorkspaceSnapshot> {
     sourceType: 'demo',
     branch,
     createdAt: Date.now(),
+    importMeta,
   };
   activeWorkspaces.set(workspaceId, meta);
 
@@ -536,6 +679,7 @@ export async function importBuggyDemoWorkspace(): Promise<WorkspaceSnapshot> {
     branch,
     files,
     fileContents,
+    importMeta,
   };
 }
 
@@ -628,11 +772,45 @@ export async function runSafeWorkspaceCommand(
         '  tsc --noEmit     Run TypeScript 7 compiler across workspace .ts/.tsx files',
         '  tsx --test       Execute unit tests with Node test runner + tsx',
         '  node --test      Execute JS/MJS test suite',
+        '  npm install|ci   Install dependencies (safe flags/args only)',
+        '  pnpm install     Install dependencies (safe flags/args only)',
+        '  yarn install     Install dependencies (safe flags/args only)',
+        '  bun install      Install dependencies (safe flags/args only)',
         '  git status       Show modified and newly added files',
         '  git diff         Show unified diff against baseline commit',
         '  ls               List workspace source files',
       ].join('\n'),
     };
+  }
+
+  const allowedInstallPatterns: Array<{ re: RegExp; cmd: string }> = [
+    { re: /^npm\s+(ci|install)(\s+(--ignore-scripts|--no-audit|--no-fund|--prefer-offline|--legacy-peer-deps))*\s*$/i, cmd: 'npm' },
+    { re: /^pnpm\s+install(\s+(--ignore-scripts|--frozen-lockfile|--frozen-lockfile=false|--no-frozen-lockfile|--prefer-offline))*\s*$/i, cmd: 'pnpm' },
+    { re: /^yarn(\s+install)?(\s+(--ignore-scripts|--frozen-lockfile|--prefer-offline|--immutable))*\s*$/i, cmd: 'yarn' },
+    { re: /^bun\s+install(\s+(--ignore-scripts|--frozen-lockfile|--no-save))*\s*$/i, cmd: 'bun' },
+  ];
+  for (const p of allowedInstallPatterns) {
+    if (p.re.test(trimmed)) {
+      const parts = trimmed.split(/\s+/);
+      try {
+        const { stdout, stderr } = await execFileAsync(parts[0], parts.slice(1), {
+          cwd: workspaceDir,
+          timeout: 120_000,
+          maxBuffer: 2 * 1024 * 1024,
+          env: { ...process.env, CI: '1' },
+        });
+        return {
+          exitCode: 0,
+          output: [stdout, stderr].filter(Boolean).join('\n').trim() || `${parts.join(' ')} completed.`,
+        };
+      } catch (err) {
+        const e = err as { stdout?: string; stderr?: string; code?: number; message?: string };
+        return {
+          exitCode: typeof e.code === 'number' ? e.code : 1,
+          output: [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim() || `${parts.join(' ')} failed.`,
+        };
+      }
+    }
   }
 
   if (trimmed === 'ls' || trimmed === 'dir') {

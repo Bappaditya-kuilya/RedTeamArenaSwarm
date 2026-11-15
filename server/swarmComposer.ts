@@ -7,11 +7,7 @@ import type {
   CursorSpeed,
   SwarmStreamEvent,
 } from '../src/types/ide';
-import {
-  detectRepoConventions,
-  resolveImportExtension,
-  selectRelevantRepoContext,
-} from './codebaseContext';
+import { detectRepoConventions, selectRelevantRepoContext } from './codebaseContext';
 import {
   computeWorkspaceGitDiff,
   getWorkspaceFileStatuses,
@@ -90,17 +86,6 @@ function detectSourcePrefix(existingFiles: Record<string, string>): string {
   return detectRepoConventions(existingFiles).sourceRoot;
 }
 
-function resolveRelativeModImport(
-  existingFiles: Record<string, string>,
-  modPath: string
-): string {
-  const conventions = detectRepoConventions(existingFiles);
-  if (conventions.hasTsConfig && !conventions.allowImportingTsExtensions) {
-    return resolveImportExtension(conventions, modPath);
-  }
-  return `./${path.basename(modPath)}`;
-}
-
 function avoidCollision(desiredPath: string, existingFiles: Record<string, string>): string {
   if (!existingFiles[desiredPath]) return desiredPath;
   const ext = path.extname(desiredPath);
@@ -116,313 +101,41 @@ export function buildFallbackFeaturePlan(
   prompt: string,
   existingFiles: Record<string, string>
 ): FeaturePlan {
-  const lower = prompt.toLowerCase();
+  const summaryLine = prompt.trim().replace(/\s+/g, ' ').slice(0, 120) || 'requested change';
+  const existingPaths = Object.keys(existingFiles).filter((p) => !p.includes('node_modules/'));
+  const preferred =
+    existingPaths.find((p) => /\.(ts|tsx|js|jsx|py|go|rs|java)$/i.test(p)) ?? existingPaths[0];
+
+  if (preferred && existingFiles[preferred] != null) {
+    const current = existingFiles[preferred];
+    const marker = `// TODO: ${summaryLine}`;
+    const next = current.includes(marker)
+      ? current
+      : `${current.replace(/\s*$/, '')}\n\n${marker}\n`;
+    return {
+      summary: `Queued one-file follow-up for: ${summaryLine}`,
+      tasks: [
+        {
+          filePath: preferred,
+          action: 'modify',
+          description: `Record requested change in ${preferred}`,
+          content: next,
+        },
+      ],
+    };
+  }
+
   const prefix = detectSourcePrefix(existingFiles);
-
-  if (/rate[\s-]?limit|throttl|token[\s-]?bucket/.test(lower)) {
-    const modPath = avoidCollision(`${prefix}rateLimit.ts`, existingFiles);
-    const testPath = modPath.replace(/\.ts$/, '.test.ts');
-    const modImport = resolveRelativeModImport(existingFiles, modPath);
-
-    return {
-      summary: 'Implemented sliding-window RateLimiter module + executable unit test suite.',
-      tasks: [
-        {
-          filePath: modPath,
-          action: 'create',
-          description: 'Write RateLimiter token-bucket middleware class',
-          content: [
-            'export interface RateLimitDecision {',
-            '  allowed: boolean;',
-            '  remaining: number;',
-            '  resetAtMs: number;',
-            '}',
-            '',
-            'export class RateLimiter {',
-            '  private readonly maxRequests: number;',
-            '  private readonly windowMs: number;',
-            '  private readonly hits = new Map<string, number[]>();',
-            '',
-            '  constructor(maxRequests = 5, windowMs = 60_000) {',
-            '    if (maxRequests <= 0) throw new RangeError("maxRequests must be positive");',
-            '    if (windowMs <= 0) throw new RangeError("windowMs must be positive");',
-            '    this.maxRequests = maxRequests;',
-            '    this.windowMs = windowMs;',
-            '  }',
-            '',
-            '  check(clientKey: string, nowMs = Date.now()): RateLimitDecision {',
-            '    const cutoff = nowMs - this.windowMs;',
-            '    const timestamps = (this.hits.get(clientKey) ?? []).filter((t) => t > cutoff);',
-            '    if (timestamps.length >= this.maxRequests) {',
-            '      const resetAtMs = timestamps[0] + this.windowMs;',
-            '      this.hits.set(clientKey, timestamps);',
-            '      return { allowed: false, remaining: 0, resetAtMs };',
-            '    }',
-            '    timestamps.push(nowMs);',
-            '    this.hits.set(clientKey, timestamps);',
-            '    return {',
-            '      allowed: true,',
-            '      remaining: Math.max(0, this.maxRequests - timestamps.length),',
-            '      resetAtMs: timestamps[0] + this.windowMs,',
-            '    };',
-            '  }',
-            '',
-            '  reset(clientKey?: string): void {',
-            '    if (clientKey) {',
-            '      this.hits.delete(clientKey);',
-            '    } else {',
-            '      this.hits.clear();',
-            '    }',
-            '  }',
-            '}',
-            '',
-          ].join('\n'),
-        },
-        {
-          filePath: testPath,
-          action: 'create',
-          description: 'Write node:test assertions for RateLimiter quota & window reset',
-          content: [
-            "import test from 'node:test';",
-            "import assert from 'node:assert/strict';",
-            `import { RateLimiter } from '${modImport}';`,
-            '',
-            "test('RateLimiter allows up to maxRequests and blocks excess calls', () => {",
-            '  const limiter = new RateLimiter(2, 1000);',
-            "  assert.equal(limiter.check('ip-1', 100).allowed, true);",
-            "  assert.equal(limiter.check('ip-1', 200).allowed, true);",
-            "  const blocked = limiter.check('ip-1', 300);",
-            '  assert.equal(blocked.allowed, false);',
-            '  assert.equal(blocked.remaining, 0);',
-            '});',
-            '',
-            "test('RateLimiter resets quota after window expires', () => {",
-            '  const limiter = new RateLimiter(1, 500);',
-            "  assert.equal(limiter.check('ip-2', 100).allowed, true);",
-            "  assert.equal(limiter.check('ip-2', 400).allowed, false);",
-            "  assert.equal(limiter.check('ip-2', 650).allowed, true);",
-            '});',
-            '',
-          ].join('\n'),
-        },
-      ],
-    };
-  }
-
-  if (/validat|sanitiz|guard|schema/.test(lower)) {
-    const modPath = avoidCollision(`${prefix}validation.ts`, existingFiles);
-    const testPath = modPath.replace(/\.ts$/, '.test.ts');
-    const modImport = resolveRelativeModImport(existingFiles, modPath);
-
-    return {
-      summary: 'Implemented strict input validation & HTML sanitizer helpers + unit tests.',
-      tasks: [
-        {
-          filePath: modPath,
-          action: 'create',
-          description: 'Write sanitizeInput, assertPositiveAmount, and isValidEmail helpers',
-          content: [
-            'const HTML_ESCAPE_MAP: Record<string, string> = {',
-            "  '&': '&amp;',",
-            "  '<': '&lt;',",
-            "  '>': '&gt;',",
-            "  '\"': '&quot;',",
-            "  \"'\": '&#39;',",
-            '};',
-            '',
-            'export function sanitizeInput(raw: string): string {',
-            '  return raw.trim().replace(/[&<>"\']/g, (ch) => HTML_ESCAPE_MAP[ch] ?? ch);',
-            '}',
-            '',
-            'export function assertPositiveAmount(value: number, field = "amount"): number {',
-            '  if (!Number.isFinite(value) || value <= 0) {',
-            '    throw new RangeError(`${field} must be a positive finite number`);',
-            '  }',
-            '  return value;',
-            '}',
-            '',
-            'export function isValidEmail(email: string): boolean {',
-            '  const normalized = email.trim();',
-            '  return /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/.test(normalized);',
-            '}',
-            '',
-          ].join('\n'),
-        },
-        {
-          filePath: testPath,
-          action: 'create',
-          description: 'Write validation unit tests covering XSS escaping and amount bounds',
-          content: [
-            "import test from 'node:test';",
-            "import assert from 'node:assert/strict';",
-            `import { assertPositiveAmount, isValidEmail, sanitizeInput } from '${modImport}';`,
-            '',
-            "test('sanitizeInput escapes dangerous HTML characters', () => {",
-            "  assert.equal(sanitizeInput(' <script>alert(\"x\")</script> '), '&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;');",
-            '});',
-            '',
-            "test('assertPositiveAmount accepts positive numbers and rejects zero/negative', () => {",
-            '  assert.equal(assertPositiveAmount(42.5), 42.5);',
-            "  assert.throws(() => assertPositiveAmount(0, 'total'), RangeError);",
-            '});',
-            '',
-            "test('isValidEmail validates standard email addresses', () => {",
-            "  assert.equal(isValidEmail('dev@swarmcode.io'), true);",
-            "  assert.equal(isValidEmail('not-an-email'), false);",
-            '});',
-            '',
-          ].join('\n'),
-        },
-      ],
-    };
-  }
-
-  if (/log|audit|telemetry|trace|metric|health/.test(lower)) {
-    const modPath = avoidCollision(`${prefix}auditLogger.ts`, existingFiles);
-    const testPath = modPath.replace(/\.ts$/, '.test.ts');
-    const modImport = resolveRelativeModImport(existingFiles, modPath);
-
-    return {
-      summary: 'Implemented structured AuditLogger with redaction + health summary + unit tests.',
-      tasks: [
-        {
-          filePath: modPath,
-          action: 'create',
-          description: 'Write structured AuditLogger with secret field redaction',
-          content: [
-            "export type LogLevel = 'info' | 'warn' | 'error';",
-            '',
-            'export interface AuditRecord {',
-            '  id: string;',
-            '  timestamp: string;',
-            '  level: LogLevel;',
-            '  event: string;',
-            '  metadata: Record<string, unknown>;',
-            '}',
-            '',
-            "const REDACTED_KEYS = new Set(['password', 'token', 'secret', 'apiKey']);",
-            '',
-            'export function redactSensitiveFields(input: Record<string, unknown>): Record<string, unknown> {',
-            '  const out: Record<string, unknown> = {};',
-            '  for (const [k, v] of Object.entries(input)) {',
-            "    out[k] = REDACTED_KEYS.has(k) ? '[REDACTED]' : v;",
-            '  }',
-            '  return out;',
-            '}',
-            '',
-            'export class AuditLogger {',
-            '  private readonly records: AuditRecord[] = [];',
-            '',
-            '  log(level: LogLevel, event: string, metadata: Record<string, unknown> = {}): AuditRecord {',
-            '    const entry: AuditRecord = {',
-            '      id: `evt-${this.records.length + 1}`,',
-            '      timestamp: new Date().toISOString(),',
-            '      level,',
-            '      event,',
-            '      metadata: redactSensitiveFields(metadata),',
-            '    };',
-            '    this.records.push(entry);',
-            '    return entry;',
-            '  }',
-            '',
-            '  list(level?: LogLevel): AuditRecord[] {',
-            '    return level ? this.records.filter((r) => r.level === level) : [...this.records];',
-            '  }',
-            '}',
-            '',
-          ].join('\n'),
-        },
-        {
-          filePath: testPath,
-          action: 'create',
-          description: 'Write unit tests for AuditLogger redaction & filtering',
-          content: [
-            "import test from 'node:test';",
-            "import assert from 'node:assert/strict';",
-            `import { AuditLogger } from '${modImport}';`,
-            '',
-            "test('AuditLogger redacts sensitive keys and preserves safe metadata', () => {",
-            '  const logger = new AuditLogger();',
-            "  const rec = logger.log('info', 'auth.login', { userId: 'u-1', token: 'secret-jwt' });",
-            "  assert.equal(rec.metadata.userId, 'u-1');",
-            "  assert.equal(rec.metadata.token, '[REDACTED]');",
-            '});',
-            '',
-            "test('AuditLogger filters entries by severity level', () => {",
-            '  const logger = new AuditLogger();',
-            "  logger.log('info', 'boot');",
-            "  logger.log('error', 'db.timeout');",
-            "  assert.equal(logger.list('error').length, 1);",
-            '});',
-            '',
-          ].join('\n'),
-        },
-      ],
-    };
-  }
-
-  const slug = slugifyPromptFeature(prompt);
-  const pascal = slug[0].toUpperCase() + slug.slice(1);
+  const slug = slugifyPromptFeature(prompt) || 'requestedChange';
   const modPath = avoidCollision(`${prefix}${slug}.ts`, existingFiles);
-  const testPath = modPath.replace(/\.ts$/, '.test.ts');
-  const modImport = resolveRelativeModImport(existingFiles, modPath);
-
   return {
-    summary: `Built ${pascal} feature module (${modPath}) and verified unit test suite (${testPath}).`,
+    summary: `Queued one-file placeholder for: ${summaryLine}`,
     tasks: [
       {
         filePath: modPath,
         action: 'create',
-        description: `Implement ${pascal} service module requested by user prompt`,
-        content: [
-          `export interface ${pascal}Options {`,
-          '  strict?: boolean;',
-          '  maxRetries?: number;',
-          '}',
-          '',
-          `export interface ${pascal}Result<T> {`,
-          '  ok: boolean;',
-          '  data: T;',
-          '  summary: string;',
-          '}',
-          '',
-          `export function execute${pascal}<T>(`,
-          '  input: T,',
-          `  options: ${pascal}Options = {}`,
-          `): ${pascal}Result<T> {`,
-          '  const strict = options.strict ?? true;',
-          '  if (strict && (input === null || input === undefined)) {',
-          `    throw new TypeError('${pascal} received empty input in strict mode');`,
-          '  }',
-          '  return {',
-          '    ok: true,',
-          '    data: input,',
-          `    summary: '${pascal} executed cleanly',`,
-          '  };',
-          '}',
-          '',
-        ].join('\n'),
-      },
-      {
-        filePath: testPath,
-        action: 'create',
-        description: `Write node:test verification suite for ${pascal}`,
-        content: [
-          "import test from 'node:test';",
-          "import assert from 'node:assert/strict';",
-          `import { execute${pascal} } from '${modImport}';`,
-          '',
-          `test('execute${pascal} returns structured success result', () => {`,
-          `  const res = execute${pascal}({ status: 'ready' });`,
-          '  assert.equal(res.ok, true);',
-          "  assert.equal(res.data.status, 'ready');",
-          '});',
-          '',
-          `test('execute${pascal} throws TypeError on null input in strict mode', () => {`,
-          `  assert.throws(() => execute${pascal}(null as unknown as string), TypeError);`,
-          '});',
-          '',
-        ].join('\n'),
+        description: `Add minimal placeholder for "${summaryLine}"`,
+        content: [`// TODO: ${summaryLine}`, ''].join('\n'),
       },
     ],
   };
@@ -450,8 +163,11 @@ async function synthesizePlanWithGemini(
     `USER INSTRUCTION: ${prompt}`,
     '',
     'ENGINEERING GUIDELINES:',
-    '- Write 2 to 4 cohesive files: implementation modules cleanly integrated with existing architecture + executable unit tests using `node:test` and `node:assert/strict` so `tsc --noEmit` and `tsx --test` verify them immediately without adding uninstalled packages.',
-    '- When modifying an existing file (`action: "modify"`), return the COMPLETE updated file content preserving all existing exports and logic.',
+    '- Produce exactly 1 file change (create or modify) that makes concrete, repo-aware progress on the request.',
+    '- Work one file at a time: return only the single most relevant file to change now.',
+    '- When modifying an existing file (`action: "modify"`), return the COMPLETE updated file content preserving all existing exports and behavior unless the request requires changing them.',
+    '- If adding tests, keep them in the same file only when idiomatic for this repo; otherwise prefer integrating into an existing relevant file.',
+    '- Do not fabricate demo/template modules unrelated to the request.',
     '',
     `REPOSITORY CONVENTIONS (${ctx.conventions.packageName}):`,
     `- Source root: ${ctx.conventions.sourceRoot || '(workspace root)'}`,
@@ -472,7 +188,7 @@ async function synthesizePlanWithGemini(
       config: {
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         systemInstruction:
-          'You are an autonomous multi-cursor engineering swarm working inside a real multi-file codebase. Produce production-grade, well-typed modules, clean integrations, and passing node:test suites with zero external uninstalled imports.',
+          'You are an autonomous multi-cursor engineering swarm working inside a real codebase. Produce one concrete, repo-aware file change at a time with natural, staged progress. Avoid fabricated demo/template behavior and do not add uninstalled dependencies.',
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -506,7 +222,7 @@ async function synthesizePlanWithGemini(
 
     const validTasks: PlannedFileEdit[] = parsed.tasks
       .filter((t) => t.filePath && t.content && !t.filePath.includes('..'))
-      .slice(0, 4)
+      .slice(0, 1)
       .map((t) => {
         const normalizedPath = t.filePath.replace(/^\/+/, '');
         return {
@@ -519,7 +235,7 @@ async function synthesizePlanWithGemini(
 
     if (validTasks.length === 0) return null;
     return {
-      summary: parsed.summary || `Generated ${validTasks.length} files for feature request.`,
+      summary: parsed.summary || `Prepared 1 file change for the request.`,
       tasks: validTasks,
     };
   } catch {
@@ -591,11 +307,11 @@ export async function runAutonomousFeatureBuild(params: {
 }): Promise<void> {
   const { workspaceId, workspaceDir, prompt, useAi = true, speed = 'slow', emit } = params;
   const mult = SPEED_MULTIPLIER[speed] ?? 1.0;
-  const numAgents = Math.max(1, Math.min(20, params.agentCount ?? 20));
+  const numAgents = 10;
 
   const agents: CursorAgentState[] = SWARM_CURSOR_PROFILES.slice(0, numAgents).map((p) => ({
     id: p.id,
-    name: p.name,
+    name: '',
     color: p.color,
     status: 'scanning',
     filePath: null,
@@ -614,7 +330,7 @@ export async function runAutonomousFeatureBuild(params: {
   emit({
     type: 'phase',
     phase: 'planning',
-    message: `All ${numAgents} cursors converging on plan for: "${prompt.trim()}"…`,
+    message: `${numAgents} cursors converging on a one-file plan for: "${prompt.trim()}"…`,
   });
 
   const beforeFiles = await readAllTextFiles(workspaceDir);
@@ -625,42 +341,17 @@ export async function runAutonomousFeatureBuild(params: {
   }
 
   const uniqueTasks: PlannedFileEdit[] = [];
-  const seenPaths = new Set<string>();
+  const seenUnique = new Set<string>();
   for (const t of plan.tasks) {
-    if (seenPaths.has(t.filePath)) continue;
-    seenPaths.add(t.filePath);
+    if (seenUnique.has(t.filePath)) continue;
+    seenUnique.add(t.filePath);
     uniqueTasks.push(t);
   }
 
-  if (numAgents >= 3 && uniqueTasks.length === 2) {
-    const implTask = uniqueTasks.find((t) => !/\.(test|spec)\./i.test(t.filePath));
-    if (implTask && implTask.filePath.endsWith('.ts')) {
-      const conventions = detectRepoConventions(beforeFiles.fileContents);
-      const prefix = conventions.sourceRoot;
-      const barrelPath = `${prefix}features.ts`;
-      if (!seenPaths.has(barrelPath)) {
-        let relImport = `./${path.relative(path.dirname(barrelPath), implTask.filePath).split(path.sep).join('/')}`;
-        if (!relImport.startsWith('.')) relImport = `./${relImport}`;
-        if (conventions.hasTsConfig && !conventions.allowImportingTsExtensions) {
-          relImport = relImport.replace(/\.(ts|tsx)$/i, '');
-        }
-        const existingBarrel = beforeFiles.fileContents[barrelPath] ?? '';
-        const exportLine = `export * from '${relImport}';`;
-        const nextBarrel = existingBarrel.includes(exportLine)
-          ? existingBarrel
-          : [existingBarrel.trimEnd(), exportLine, ''].filter(Boolean).join('\n');
-        seenPaths.add(barrelPath);
-        uniqueTasks.push({
-          filePath: barrelPath,
-          action: existingBarrel ? 'modify' : 'create',
-          description: `Export ${path.basename(implTask.filePath)} from workspace feature index`,
-          content: nextBarrel,
-        });
-      }
-    }
-  }
+  const activeTasks = uniqueTasks.slice(0, 1);
+  const seenPaths = new Set(activeTasks.map((t) => t.filePath));
 
-  const planSteps: ComposerPlanStep[] = uniqueTasks.map((t, idx) => ({
+  const planSteps: ComposerPlanStep[] = activeTasks.map((t, idx) => ({
     id: `step-${idx + 1}`,
     filePath: t.filePath,
     action: t.action,
@@ -679,14 +370,14 @@ export async function runAutonomousFeatureBuild(params: {
   emit({
     type: 'phase',
     phase: 'writing',
-    message: `Swarm (${numAgents} cursors, ${speed} pace) writing ${uniqueTasks.length} file(s)…`,
+    message: `${numAgents} cursors working one file at a time: ${activeTasks[0]?.filePath ?? 'no target file'}…`,
   });
 
   let createdCount = 0;
   let modifiedCount = 0;
 
-  for (let tIdx = 0; tIdx < uniqueTasks.length; tIdx++) {
-    const task = uniqueTasks[tIdx];
+  for (let tIdx = 0; tIdx < activeTasks.length; tIdx++) {
+    const task = activeTasks[tIdx];
     const leadAgent = agents[0];
 
     for (let i = 0; i < agents.length; i++) {
@@ -697,13 +388,13 @@ export async function runAutonomousFeatureBuild(params: {
       agents[i].task =
         i === 0
           ? `${task.action === 'create' ? 'Creating' : 'Opening'} ${task.filePath}…`
-          : `Collaborating on ${task.filePath}`;
+          : `Assisting in ${task.filePath}`;
       emit({
         type: 'agent:update',
         agent: { ...agents[i] },
         logLine:
           i === 0
-            ? `[Swarm ${tIdx + 1}/${uniqueTasks.length}] All ${numAgents} cursors ${task.action === 'create' ? 'creating' : 'editing'} ${task.filePath}`
+            ? `[swarm] ${numAgents} cursors ${task.action === 'create' ? 'creating' : 'editing'} ${task.filePath}`
             : undefined,
       });
     }
@@ -901,7 +592,7 @@ export async function runAutonomousFeatureBuild(params: {
       testResult: finalDebug.testResult,
       terminalLines: [
         ...finalDebug.terminalLines,
-        `[Swarm-Builder] Built ${createdCount} new file(s), modified ${modifiedCount} file(s).`,
+        `[swarm] Active file complete: ${createdCount} created, ${modifiedCount} modified.`,
       ],
       gitDiff: finalDiff,
       fileStatuses: finalStatuses,

@@ -33,7 +33,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '2mb' }));
 
@@ -108,11 +108,12 @@ app.post('/api/repo/:workspaceId/swarm-fix', async (req, res) => {
     return res.status(404).json({ error: 'Workspace session expired or not found.' });
   }
 
-  const { agentCount = 20, useAi = true, speed } = (req.body || {}) as {
+  const { useAi = true, speed } = (req.body || {}) as {
     agentCount?: number;
     useAi?: boolean;
     speed?: CursorSpeed;
   };
+  const agentCount = 10;
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -155,12 +156,13 @@ app.post('/api/repo/:workspaceId/composer', async (req, res) => {
     return res.status(404).json({ error: 'Workspace session expired or not found.' });
   }
 
-  const { prompt, agentCount = 20, useAi = true, speed } = (req.body || {}) as {
+  const { prompt, useAi = true, speed } = (req.body || {}) as {
     prompt?: string;
     agentCount?: number;
     useAi?: boolean;
     speed?: CursorSpeed;
   };
+  const agentCount = 10;
 
   if (!prompt || typeof prompt !== 'string' || prompt.trim().length < 3) {
     return res.status(400).json({ error: 'Enter a feature or code instruction for the Cursor swarm.' });
@@ -263,59 +265,71 @@ app.post('/api/repo/:workspaceId/apply-fix', async (req, res) => {
       diagnosticId,
       applyAll = false,
       manualEdit,
+      useAi = false,
     } = req.body as {
       diagnostics?: CodeDiagnostic[];
       diagnosticId?: string;
       applyAll?: boolean;
       manualEdit?: { filePath: string; content: string };
+      useAi?: boolean;
     };
 
-    const { fileContents } = await readAllTextFiles(meta.dir);
-    let appliedIds = new Set<string>();
+    const before = await readAllTextFiles(meta.dir);
+    const fileContents = before.fileContents;
     const updatedFiles: Record<string, string> = {};
+    let requestedPatchCount = 0;
 
     if (manualEdit && typeof manualEdit.filePath === 'string') {
-      await writeWorkspaceFile(meta.dir, manualEdit.filePath, manualEdit.content);
-      updatedFiles[manualEdit.filePath] = manualEdit.content;
+      const prev = fileContents[manualEdit.filePath];
+      if (prev !== manualEdit.content) {
+        await writeWorkspaceFile(meta.dir, manualEdit.filePath, manualEdit.content);
+        updatedFiles[manualEdit.filePath] = manualEdit.content;
+        requestedPatchCount = 1;
+      }
     } else if (applyAll) {
       const resAll = applyAllFixesToFiles(fileContents, diagnostics);
-      appliedIds = resAll.appliedIds;
       for (const [fp, nextContent] of Object.entries(resAll.updatedFiles)) {
-        if (nextContent !== fileContents[fp]) {
+        if (fileContents[fp] !== undefined && nextContent !== fileContents[fp]) {
           await writeWorkspaceFile(meta.dir, fp, nextContent);
           updatedFiles[fp] = nextContent;
         }
       }
+      requestedPatchCount = resAll.appliedIds.size;
     } else if (diagnosticId) {
       const targetDiag = diagnostics.find((d) => d.id === diagnosticId);
       if (targetDiag && fileContents[targetDiag.filePath] !== undefined) {
-        const nextContent = applyDiagnosticFixToContent(
-          fileContents[targetDiag.filePath],
-          targetDiag
-        );
-        if (nextContent !== fileContents[targetDiag.filePath]) {
-          await writeWorkspaceFile(meta.dir, targetDiag.filePath, nextContent);
-          updatedFiles[targetDiag.filePath] = nextContent;
-          appliedIds.add(targetDiag.id);
+        const hasPatch = Boolean(targetDiag.suggestedLinePatch || targetDiag.suggestedFilePatch);
+        if (hasPatch) {
+          const nextContent = applyDiagnosticFixToContent(fileContents[targetDiag.filePath], targetDiag);
+          if (nextContent !== fileContents[targetDiag.filePath]) {
+            await writeWorkspaceFile(meta.dir, targetDiag.filePath, nextContent);
+            updatedFiles[targetDiag.filePath] = nextContent;
+            requestedPatchCount = 1;
+          }
         }
       }
     }
 
+    // Truthful post-fix state: recompute diff/status and re-scan/verify. Do not mark fixed without evidence.
+    const after = await readAllTextFiles(meta.dir);
+    const verification = await runParallelDebugSwarm(meta.dir, after.fileContents, Boolean(useAi));
     const [gitDiff, fileStatuses] = await Promise.all([
       computeWorkspaceGitDiff(meta.dir),
       getWorkspaceFileStatuses(meta.dir),
     ]);
-    const nextDiagnostics = diagnostics.map((d) =>
-      appliedIds.has(d.id) ? { ...d, fixed: true } : d
+
+    const remainingErrors = verification.diagnostics.filter((d) => d.severity === 'error').length;
+    console.log(
+      `[apply-fix] workspace=${meta.workspaceId} appliedReal=${Object.keys(updatedFiles).length} requested=${requestedPatchCount} remaining=${verification.diagnostics.length} remainingErrors=${remainingErrors} tscErrors=${verification.tscResult.errorCount} testsFailed=${verification.testResult.failed}`
     );
 
     return res.json({
       workspaceId: meta.workspaceId,
-      appliedCount: appliedIds.size || (manualEdit ? 1 : 0),
+      appliedCount: Object.keys(updatedFiles).length,
       updatedFiles,
       gitDiff,
       fileStatuses,
-      diagnostics: nextDiagnostics,
+      diagnostics: verification.diagnostics,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to apply fix to workspace.';

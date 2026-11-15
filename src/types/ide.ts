@@ -4,6 +4,13 @@ export type DiagnosticSource = 'typescript' | 'security' | 'bug' | 'test' | 'ai'
 
 export type DiagnosticSeverity = 'error' | 'warning' | 'info';
 
+export type DiagnosticVerificationStatus =
+  | 'open'
+  | 'attempted'
+  | 'verified'
+  | 'reverted'
+  | 'unfixable';
+
 export type GitFileStatus = 'M' | 'A';
 
 export type CursorSpeed = 'slow' | 'normal' | 'fast';
@@ -74,6 +81,11 @@ export interface CodeDiagnostic {
   fixed: boolean;
   fixedByAgentId?: string;
   verified?: boolean;
+  verificationStatus?: DiagnosticVerificationStatus;
+  attemptedFix?: boolean;
+  unfixableReason?: string;
+  provenance?: string;
+  evidence?: string[];
 }
 
 export interface TestRunResult {
@@ -117,6 +129,16 @@ export interface DebugRunResponse {
   gitDiff: string;
   fileStatuses?: Record<string, GitFileStatus>;
   totalElapsedMs: number;
+  scanEvidence?: {
+    source: 'real-debug-endpoint';
+    coverage: {
+      tsc: boolean;
+      tests: boolean;
+      security: boolean;
+      bug: boolean;
+      ai: boolean;
+    };
+  };
 }
 
 export interface ApplyFixResponse {
@@ -126,6 +148,7 @@ export interface ApplyFixResponse {
   gitDiff: string;
   fileStatuses?: Record<string, GitFileStatus>;
   diagnostics: CodeDiagnostic[];
+  verification?: 'server-scan-required' | 'attempted' | 'verified' | 'unfixable';
 }
 
 export interface ComposerPlanStep {

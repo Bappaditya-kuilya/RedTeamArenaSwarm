@@ -73,7 +73,7 @@ export function renderHighlightedLine(line: string): ReactNode {
   while ((match = TOKEN_RE.exec(line)) !== null) {
     if (match.index > lastIndex) {
       parts.push(
-        <span key={key++} className="text-[#374151]">
+        <span key={key++} className="text-[#d4d4d4]">
           {line.slice(lastIndex, match.index)}
         </span>
       );
@@ -81,22 +81,22 @@ export function renderHighlightedLine(line: string): ReactNode {
 
     const token = match[0];
     const afterChar = line[match.index + token.length] ?? '';
-    let colorClass = 'text-[#1C1E21]';
+    let colorClass = 'text-[#9cdcfe]';
 
     if (token.startsWith('//') || token.startsWith('/*')) {
-      colorClass = 'text-[#6B7280] italic';
+      colorClass = 'text-[#6a9955] italic';
     } else if (token.startsWith("'") || token.startsWith('"') || token.startsWith('`')) {
-      colorClass = 'text-[#0369A1]';
+      colorClass = 'text-[#ce9178]';
     } else if (/^\d/.test(token)) {
-      colorClass = 'text-[#0F766E]';
+      colorClass = 'text-[#b5cea8]';
     } else if (CONTROL_KEYWORDS.has(token)) {
-      colorClass = 'text-[#2563EB] font-medium';
+      colorClass = 'text-[#c586c0]';
     } else if (DECL_KEYWORDS.has(token)) {
-      colorClass = 'text-[#1D4ED8]';
+      colorClass = 'text-[#569cd6]';
     } else if (afterChar === '(') {
-      colorClass = 'text-[#1E40AF]';
+      colorClass = 'text-[#dcdcaa]';
     } else if (/^[A-Z]/.test(token)) {
-      colorClass = 'text-[#0F766E]';
+      colorClass = 'text-[#4ec9b0]';
     }
 
     parts.push(
@@ -109,7 +109,7 @@ export function renderHighlightedLine(line: string): ReactNode {
 
   if (lastIndex < line.length) {
     parts.push(
-      <span key={key++} className="text-[#374151]">
+      <span key={key++} className="text-[#d4d4d4]">
         {line.slice(lastIndex)}
       </span>
     );

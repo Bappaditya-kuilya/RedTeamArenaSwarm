@@ -4,8 +4,8 @@ import {
   ChevronDown,
   ChevronRight,
   Columns2,
-  MousePointer2,
   RotateCcw,
+  ScanSearch,
   X,
 } from 'lucide-react';
 import { renderHighlightedLine } from '../utils/vscodeHighlight';
@@ -136,13 +136,13 @@ export function EditorPane({
       data-editor-pane={paneId}
       onClick={onFocusPane}
       aria-label={paneId === 'primary' ? 'Primary Editor Pane' : 'Split Editor Pane'}
-      className={`flex-1 flex flex-col min-w-0 min-h-0 bg-[#FFFFFF] ${
-        paneId === 'secondary' ? 'border-l border-[#E0E2E5]' : ''
+      className={`flex-1 flex flex-col min-w-0 min-h-0 bg-[#1e1e1e] ${
+        paneId === 'secondary' ? 'border-l border-[#252526]' : ''
       }`}
     >
       {/* Editor Tabs Bar */}
-      <div className="h-[36px] bg-[#F8F9FA] border-b border-[#E0E2E5] flex items-center justify-between shrink-0">
-        <div className="flex items-center overflow-x-auto h-full min-w-0">
+      <div className="h-[35px] bg-[#252526] border-b border-[#1e1e1e] flex items-center justify-between shrink-0">
+        <div className="flex items-end overflow-x-auto h-full min-w-0">
           {tabs.map((tabPath) => {
             const isActive = tabPath === activeFilePath;
             const fileName = tabPath.split('/').pop() ?? tabPath;
@@ -158,14 +158,14 @@ export function EditorPane({
 
             const tabTextColor =
               gitStatus === 'A'
-                ? 'text-[#14AE5C]'
+                ? 'text-[#81b88b]'
                 : gitStatus === 'M'
-                ? 'text-[#D97706]'
+                ? 'text-[#e2c08d]'
                 : openErrors > 0 && !isActive
-                ? 'text-[#F24822]'
+                ? 'text-[#f48771]'
                 : isActive
-                ? 'text-[#121417] font-medium'
-                : 'text-[#6B7078]';
+                ? 'text-[#ffffff]'
+                : 'text-[#969696]';
 
             return (
               <div
@@ -176,27 +176,33 @@ export function EditorPane({
                   onFocusPane();
                   onSelectFile(tabPath);
                 }}
-                className={`group h-full flex items-center gap-2 px-3 border-r border-[#E0E2E5] text-[12px] font-mono cursor-pointer shrink-0 transition-colors ${
+                className={`group h-[35px] flex items-center gap-1.5 pl-2.5 pr-2 border-r border-[#252526] text-[13px] cursor-pointer shrink-0 transition-colors ${
                   isActive
-                    ? `bg-[#FFFFFF] border-t-2 ${
-                        isFocused ? 'border-t-[#0D99FF]' : 'border-t-[#9DA2A9]'
-                      }`
-                    : 'bg-[#F8F9FA] hover:bg-[#FFFFFF]/70 border-t-2 border-t-transparent'
+                    ? `bg-[#1e1e1e] ${isFocused ? 'border-t border-t-[#007acc]' : 'border-t border-t-transparent'}`
+                    : 'bg-[#2d2d2d] hover:bg-[#2a2d2e] border-t border-t-transparent'
                 }`}
               >
-                <VsCodeFileIcon filePath={tabPath} />
-                <span className={tabTextColor}>{fileName}</span>
+                <VsCodeFileIcon filePath={tabPath} className="w-[16px] h-[16px]" />
+                <span className={`max-w-[150px] truncate ${tabTextColor}`}>{fileName}</span>
 
                 {activeTabAgents.length > 0 && (
-                  <span className="px-1.5 py-0.5 rounded-[4px] bg-[#E6F4FF] text-[#0D99FF] text-[9.5px] font-semibold tabular-nums">
+                  <span
+                    className="inline-flex items-center gap-1 px-1 py-0 rounded bg-[#094771] text-[#ffffff] text-[10px] font-semibold tabular-nums"
+                    title={`${activeTabAgents.length} cursor(s) working in this file`}
+                  >
+                    <span className="flex -space-x-0.5">
+                      {activeTabAgents.slice(0, 3).map((a) => (
+                        <span key={a.id} className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: a.color }} />
+                      ))}
+                    </span>
                     {activeTabAgents.length}
                   </span>
                 )}
 
                 {gitStatus && activeTabAgents.length === 0 && (
                   <span
-                    className={`text-[10px] font-bold ${
-                      gitStatus === 'A' ? 'text-[#14AE5C]' : 'text-[#D97706]'
+                    className={`text-[11px] font-semibold ${
+                      gitStatus === 'A' ? 'text-[#81b88b]' : 'text-[#e2c08d]'
                     }`}
                   >
                     {gitStatus}
@@ -204,7 +210,7 @@ export function EditorPane({
                 )}
 
                 {openErrors > 0 && (
-                  <span className="text-[10px] text-[#F24822] font-semibold tabular-nums">
+                  <span className="text-[11px] text-[#f14c4c] font-semibold tabular-nums">
                     {openErrors}
                   </span>
                 )}
@@ -216,9 +222,9 @@ export function EditorPane({
                     e.stopPropagation();
                     onCloseTab(tabPath);
                   }}
-                  className="p-0.5 rounded-[4px] hover:bg-[#E0E2E5] text-[#6B7078] hover:text-[#121417] opacity-70 group-hover:opacity-100"
+                  className={`ml-0.5 p-0.5 rounded hover:bg-[#ffffff]/10 text-[#969696] hover:text-[#ffffff] ${isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}
                 >
-                  <X className="w-3 h-3" aria-hidden="true" />
+                  <X className="w-3.5 h-3.5" strokeWidth={1.75} aria-hidden="true" />
                 </button>
               </div>
             );
@@ -226,12 +232,12 @@ export function EditorPane({
         </div>
 
         {/* Editor Group Actions */}
-        <div className="flex items-center gap-1 px-2 shrink-0">
+        <div className="flex items-center gap-0.5 px-2 shrink-0">
           {activeFilePath && !isEditingManual && (
             <button
               type="button"
               onClick={() => setIsEditingManual(true)}
-              className="h-6 px-2.5 text-[11px] font-medium rounded-[6px] text-[#30343A] hover:bg-[#E0E2E5]/60 transition-colors"
+              className="h-6 px-2 text-[12px] rounded text-[#cccccc] hover:bg-[#ffffff]/10 transition-colors"
               title="Edit File Manually"
             >
               Edit
@@ -245,7 +251,7 @@ export function EditorPane({
                   onSaveManualEdit(activeFilePath, manualDraft);
                   setIsEditingManual(false);
                 }}
-                className="h-6 px-2.5 text-[11px] font-medium rounded-[6px] bg-[#0D99FF] hover:bg-[#0080E6] text-white transition-colors"
+                className="h-6 px-2 text-[12px] rounded bg-[#007acc] hover:bg-[#1f8ad2] text-white transition-colors"
               >
                 Save
               </button>
@@ -255,7 +261,7 @@ export function EditorPane({
                   setManualDraft(activeContent);
                   setIsEditingManual(false);
                 }}
-                className="h-6 px-2.5 text-[11px] font-medium rounded-[6px] bg-[#FFFFFF] border border-[#E0E2E5] text-[#30343A] hover:bg-[#F8F9FA]"
+                className="h-6 px-2 text-[12px] rounded bg-[#3c3c3c] text-[#cccccc] hover:bg-[#4c4c4c]"
               >
                 Cancel
               </button>
@@ -266,10 +272,10 @@ export function EditorPane({
               type="button"
               disabled={busy}
               onClick={onResetGit}
-              title="Reset Workspace to Clean Git Baseline"
-              className="h-6 px-1.5 text-[11px] rounded-[6px] text-[#6B7078] hover:text-[#121417] hover:bg-[#E0E2E5]/60 inline-flex items-center gap-1"
+              title="Reset Workspace"
+              className="h-6 w-6 text-[#cccccc] hover:bg-[#ffffff]/10 rounded inline-flex items-center justify-center disabled:opacity-40"
             >
-              <RotateCcw className="w-3 h-3" aria-hidden="true" />
+              <RotateCcw className="w-4 h-4" strokeWidth={1.75} aria-hidden="true" />
             </button>
           )}
           {paneId === 'primary' && onSplitRight && (
@@ -278,13 +284,13 @@ export function EditorPane({
               onClick={onSplitRight}
               aria-label={isSplitActive ? 'Close Split Editor' : 'Split Editor Right'}
               title={isSplitActive ? 'Close Split Editor' : 'Split Editor Right'}
-              className={`h-6 w-6 rounded-[6px] inline-flex items-center justify-center transition-colors ${
+              className={`h-6 w-6 rounded inline-flex items-center justify-center transition-colors ${
                 isSplitActive
-                  ? 'bg-[#E6F4FF] text-[#0D99FF]'
-                  : 'text-[#6B7078] hover:text-[#121417] hover:bg-[#E0E2E5]/60'
+                  ? 'bg-[#094771] text-[#ffffff]'
+                  : 'text-[#cccccc] hover:bg-[#ffffff]/10'
               }`}
             >
-              <Columns2 className="w-3.5 h-3.5" aria-hidden="true" />
+              <Columns2 className="w-4 h-4" strokeWidth={1.75} aria-hidden="true" />
             </button>
           )}
           {paneId === 'secondary' && onClosePane && (
@@ -293,47 +299,63 @@ export function EditorPane({
               onClick={onClosePane}
               aria-label="Close Split Pane"
               title="Close Split Pane"
-              className="h-6 w-6 rounded-[6px] text-[#6B7078] hover:text-[#121417] hover:bg-[#E0E2E5]/60 inline-flex items-center justify-center"
+              className="h-6 w-6 rounded text-[#cccccc] hover:bg-[#ffffff]/10 inline-flex items-center justify-center"
             >
-              <X className="w-3.5 h-3.5" aria-hidden="true" />
+              <X className="w-4 h-4" strokeWidth={1.75} aria-hidden="true" />
             </button>
           )}
         </div>
       </div>
 
       {/* Breadcrumbs Bar */}
-      <div className="h-[24px] px-3 bg-[#FFFFFF] border-b border-[#E0E2E5] flex items-center justify-between gap-3 text-[11px] font-mono text-[#6B7078] shrink-0">
-        <div className="flex items-center gap-1 min-w-0 truncate">
+      <div className="h-[22px] px-3 bg-[#1e1e1e] flex items-center justify-between gap-3 text-[12px] text-[#969696] shrink-0 border-b border-[#1e1e1e]">
+        <div className="flex items-center gap-0.5 min-w-0 truncate">
           {breadcrumbs.map((seg, i) => (
-            <span key={`${seg}-${i}`} className="flex items-center gap-1 min-w-0">
-              {i > 0 && <ChevronRight className="w-3 h-3 text-[#9DA2A9] shrink-0" aria-hidden="true" />}
-              <span className={i === breadcrumbs.length - 1 ? 'text-[#121417] font-medium' : ''}>
+            <span key={`${seg}-${i}`} className="flex items-center gap-0.5 min-w-0">
+              {i > 0 && <ChevronRight className="w-3.5 h-3.5 text-[#6a6a6a] shrink-0" strokeWidth={1.5} aria-hidden="true" />}
+              <span className={i === breadcrumbs.length - 1 ? 'text-[#cccccc]' : 'hover:text-[#cccccc] cursor-pointer'}>
                 {seg}
               </span>
             </span>
           ))}
         </div>
 
-        {primaryCursor && (
-          <span
-            className="inline-flex items-center gap-1.5 text-[10.5px] font-medium truncate shrink-0"
-            style={{ color: primaryCursor.color }}
-          >
-            <MousePointer2 className="w-3 h-3 shrink-0" aria-hidden="true" />
-            <span>
-              {primaryCursor.name} · Ln {primaryCursor.line}, Col {primaryCursor.column}
-              {cursorsInFile.length > 1 ? ` (+${cursorsInFile.length - 1} in file)` : ''}
+        <span className="inline-flex items-center gap-2 text-[11px] truncate shrink-0">
+          {isStreamingHere && (
+            <span className="inline-flex items-center gap-1 text-[#3794ff]">
+              <ScanSearch className="w-3.5 h-3.5" strokeWidth={1.75} aria-hidden="true" />
+              streaming
             </span>
-          </span>
-        )}
+          )}
+          {cursorsInFile.length > 0 ? (
+            <span className="inline-flex items-center gap-1.5 text-[#cccccc]">
+              <span className="flex -space-x-1">
+                {cursorsInFile.slice(0, 4).map((agent) => (
+                  <span
+                    key={agent.id}
+                    className="w-2 h-2 rounded-full ring-1 ring-[#1e1e1e]"
+                    style={{ backgroundColor: agent.color }}
+                    title={`${agent.status} · Ln ${agent.line}, Col ${agent.column}`}
+                  />
+                ))}
+              </span>
+              <span className="text-[#969696]">
+                {cursorsInFile.length} cursor{cursorsInFile.length === 1 ? '' : 's'} ·{' '}
+                {primaryCursor ? `Ln ${primaryCursor.line}, Col ${primaryCursor.column}` : ''}
+              </span>
+            </span>
+          ) : (
+            <span className="text-[#6a6a6a]"> </span>
+          )}
+        </span>
       </div>
 
-      {/* Code Viewport + Proportional Minimap */}
+      {/* Code Viewport + Minimap */}
       {!activeFilePath ? (
-        <div className="flex-1 flex flex-col items-center justify-center text-center p-6 bg-[#FFFFFF] text-[#6B7078]">
-          <p className="text-sm font-semibold text-[#121417]">Swarm Code Workbench</p>
-          <p className="text-xs mt-1 max-w-sm">
-            Select a file from Explorer, click Auto-Fix, or give all 20 cursors a task in the right panel.
+        <div className="flex-1 flex flex-col items-center justify-center text-center p-6 bg-[#1e1e1e] text-[#969696]">
+          <p className="text-sm font-medium text-[#cccccc]">No editor is open</p>
+          <p className="text-xs mt-1 max-w-sm text-[#858585]">
+            Select a file from the explorer, or import a repo and run a scan.
           </p>
         </div>
       ) : isEditingManual ? (
@@ -342,13 +364,13 @@ export function EditorPane({
           value={manualDraft}
           onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setManualDraft(e.target.value)}
           spellCheck={false}
-          className="flex-1 w-full bg-[#FFFFFF] text-[#121417] font-mono text-[12.5px] leading-[20px] p-4 focus:outline-none resize-none"
+          className="flex-1 w-full bg-[#1e1e1e] text-[#d4d4d4] font-mono text-[13px] leading-[20px] p-4 focus:outline-none resize-none"
         />
       ) : (
-        <div className="flex-1 flex min-h-0 overflow-hidden bg-[#FFFFFF]">
+        <div className="flex-1 flex min-h-0 overflow-hidden bg-[#1e1e1e]">
           <div
             ref={scrollRef}
-            className="flex-1 overflow-auto py-2 font-mono text-[12.5px] leading-[20px] select-text"
+            className="flex-1 overflow-auto py-1 font-mono text-[13px] leading-[20px] select-text"
           >
             <div className="min-w-max">
               {codeLines.map((lineText, idx) => {
@@ -368,18 +390,15 @@ export function EditorPane({
 
                 let rowBg = '';
                 if (isWritingHere || lineCursors.some((c) => c.status === 'writing' || c.status === 'editing')) {
-                  rowBg = 'bg-[#0D99FF]/[0.08]';
+                  rowBg = 'bg-[#264f78]/30';
                 } else if (lineCursors.length > 0) {
-                  rowBg = 'bg-[#F8F9FA]';
+                  rowBg = 'bg-[#2a2d2e]/60';
                 } else if (isSelectedDiag) {
-                  rowBg = 'bg-[#0D99FF]/[0.11]';
+                  rowBg = 'bg-[#264f78]/40';
                 } else if (openDiag) {
-                  rowBg =
-                    openDiag.severity === 'error'
-                      ? 'bg-[#FEF2F2]'
-                      : 'bg-[#FFFBEB]';
+                  rowBg = openDiag.severity === 'error' ? 'bg-[#5a1d1d]/40' : 'bg-[#4d3800]/30';
                 } else if (fixedDiag) {
-                  rowBg = 'bg-[#ECFDF5]';
+                  rowBg = 'bg-[#1e3a1e]/30';
                 }
 
                 const primaryLineCursor = lineCursors[0];
@@ -391,10 +410,10 @@ export function EditorPane({
                     onClick={() => {
                       if (lineDiags[0]) onSelectDiagnostic(lineDiags[0]);
                     }}
-                    className={`group flex items-start pr-4 relative transition-colors ${rowBg}`}
+                    className={`group flex items-start pr-4 relative ${rowBg}`}
                   >
-                    {/* Gutter: Line Number + Fold Indicator + Diagnostic Dot */}
-                    <span className="w-[46px] pr-1.5 text-right text-[#8F949B] select-none shrink-0 flex items-center justify-end gap-1">
+                    {/* Gutter */}
+                    <span className="w-[60px] pr-3 text-right text-[#858585] select-none shrink-0 flex items-center justify-end gap-1.5">
                       {primaryLineCursor ? (
                         <span
                           className="w-1.5 h-3.5 rounded-[1px]"
@@ -402,28 +421,28 @@ export function EditorPane({
                         />
                       ) : openDiag ? (
                         <span
-                          className={`w-1.5 h-1.5 rounded-full ${
-                            openDiag.severity === 'error' ? 'bg-[#F24822]' : 'bg-[#D97706]'
+                          className={`w-2 h-2 rounded-full ${
+                            openDiag.severity === 'error' ? 'bg-[#f14c4c]' : 'bg-[#cca700]'
                           }`}
                         />
                       ) : fixedDiag ? (
-                        <span className="w-1.5 h-1.5 rounded-full bg-[#14AE5C]" />
+                        <span className="w-2 h-2 rounded-full bg-[#89d185]" />
                       ) : null}
-                      <span className="text-[11px] leading-[20px]">{lineNum}</span>
-                      <span className="w-2.5 inline-flex justify-center opacity-0 group-hover:opacity-70 text-[#6B7078]">
-                        {hasFold && <ChevronDown className="w-2.5 h-2.5" aria-hidden="true" />}
+                      <span className="text-[13px] leading-[20px] tabular-nums">{lineNum}</span>
+                      <span className="w-3 inline-flex justify-center opacity-0 group-hover:opacity-70 text-[#c5c5c5]">
+                        {hasFold && <ChevronDown className="w-3 h-3" strokeWidth={1.5} aria-hidden="true" />}
                       </span>
                     </span>
 
-                    {/* Code Line + Indent Guides + Caret */}
-                    <div className="flex-1 min-w-0 relative whitespace-pre">
+                    {/* Code Line */}
+                    <div className="flex-1 min-w-0 relative whitespace-pre pl-1">
                       {indentDepth > 0 &&
-                        Array.from({ length: Math.min(indentDepth, 6) }).map((_, gIdx) => (
+                        Array.from({ length: Math.min(indentDepth, 8) }).map((_, gIdx) => (
                           <span
                             key={gIdx}
                             aria-hidden="true"
-                            style={{ left: `${gIdx * 2}ch` }}
-                            className="absolute top-0 bottom-0 w-px bg-[#E0E2E5] pointer-events-none"
+                            style={{ left: `${gIdx * 2 + 0.25}ch` }}
+                            className="absolute top-0 bottom-0 w-px bg-[#404040] pointer-events-none"
                           />
                         ))}
 
@@ -432,9 +451,9 @@ export function EditorPane({
                           openDiag
                             ? `underline decoration-wavy ${
                                 openDiag.severity === 'error'
-                                  ? 'decoration-[#F24822]'
-                                  : 'decoration-[#D97706]'
-                              }`
+                                  ? 'decoration-[#f14c4c]'
+                                  : 'decoration-[#cca700]'
+                              } underline-offset-2`
                             : ''
                         }
                       >
@@ -449,7 +468,7 @@ export function EditorPane({
                         return (
                           <span
                             key={agent.id}
-                            style={{ left: `${agentCaretCol}ch` }}
+                            style={{ left: `${agentCaretCol + 0.25}ch` }}
                             className="absolute top-0 pointer-events-none z-10 transition-[left] duration-300 ease-out"
                           >
                             <span
@@ -461,15 +480,16 @@ export function EditorPane({
                       })}
                     </div>
 
-                    {/* Inline ErrorLens Diagnostic Annotation */}
+                    {/* Inline diagnostic annotation */}
                     {openDiag && lineCursors.length === 0 && !isSplitActive && (
-                      <span className="ml-6 inline-flex items-center gap-2 shrink-0 text-[11px] font-sans max-w-[340px]">
+                      <span className="ml-6 inline-flex items-center gap-2 shrink-0 text-[12px] font-sans max-w-[420px]">
                         <span
                           className={`truncate ${
-                            openDiag.severity === 'error' ? 'text-[#F24822]' : 'text-[#B45309]'
+                            openDiag.severity === 'error' ? 'text-[#f48771]' : 'text-[#cca700]'
                           }`}
+                          title={openDiag.message}
                         >
-                          [{openDiag.code}] {openDiag.title}
+                          [{openDiag.source}] {openDiag.severity} · {openDiag.code}
                         </span>
                         {(openDiag.suggestedLinePatch || openDiag.suggestedFilePatch) && (
                           <button
@@ -478,7 +498,8 @@ export function EditorPane({
                               e.stopPropagation();
                               onApplySingleFix(openDiag.id);
                             }}
-                            className="px-2 py-0.5 rounded-[4px] bg-[#E6F4FF] hover:bg-[#0D99FF] text-[#0D99FF] hover:text-white text-[10px] font-medium shrink-0 transition-colors"
+                            className="px-2 py-0.5 rounded bg-[#094771] hover:bg-[#0e639c] text-[#ffffff] text-[11px] shrink-0 transition-colors"
+                            title="Apply suggested repair"
                           >
                             Quick Fix
                           </button>
@@ -491,7 +512,7 @@ export function EditorPane({
             </div>
           </div>
 
-          {/* Proportional Code Minimap */}
+          {/* Minimap */}
           <div
             aria-label="Editor Minimap"
             onClick={(e) => {
@@ -499,38 +520,38 @@ export function EditorPane({
               const ratio = Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)));
               handleMinimapClick(ratio);
             }}
-            className="w-[44px] bg-[#F8F9FA] border-l border-[#E0E2E5] py-2 px-1 shrink-0 cursor-pointer overflow-hidden relative select-none"
-            title="Click minimap to jump"
+            className="w-[60px] bg-[#1e1e1e] border-l border-[#2b2b2b] py-1 px-1.5 shrink-0 cursor-pointer overflow-hidden relative select-none"
+            title="Minimap"
           >
-            <div className="space-y-[2px]">
-              {codeLines.slice(0, 140).map((lineText, idx) => {
+            <div className="space-y-[2px] opacity-60">
+              {codeLines.slice(0, 180).map((lineText, idx) => {
                 const lineNum = idx + 1;
                 const trimmed = lineText.trim();
                 const hasError = fileDiagnostics.some((d) => d.line === lineNum && !d.fixed);
                 const hasCursor = cursorsInFile.some((c) => c.line === lineNum);
                 const activeCursor = cursorsInFile.find((c) => c.line === lineNum);
-                const widthPct = trimmed.length === 0 ? 0 : Math.min(100, Math.max(18, Math.round((trimmed.length / 72) * 100)));
+                const widthPct = trimmed.length === 0 ? 0 : Math.min(100, Math.max(15, Math.round((trimmed.length / 72) * 100)));
 
-                let barColor = 'bg-[#D7DADE]';
+                let barColor = 'bg-[#5a5a5a]';
                 if (hasCursor && activeCursor) {
                   barColor = '';
                 } else if (hasError) {
-                  barColor = 'bg-[#F24822]';
-                } else if (trimmed.startsWith('//') || trimmed.startsWith('/*')) {
-                  barColor = 'bg-[#9DA2A9]';
+                  barColor = 'bg-[#f14c4c]';
+                } else if (trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*')) {
+                  barColor = 'bg-[#6a9955]';
                 } else if (trimmed.startsWith('export') || trimmed.startsWith('import')) {
-                  barColor = 'bg-[#0D99FF]/60';
+                  barColor = 'bg-[#c586c0]';
                 }
 
                 return (
-                  <div key={lineNum} className="h-[2.5px] flex items-center">
+                  <div key={lineNum} className="h-[2px] flex items-center">
                     {widthPct > 0 && (
                       <div
                         style={{
                           width: `${widthPct}%`,
                           backgroundColor: hasCursor && activeCursor ? activeCursor.color : undefined,
                         }}
-                        className={`h-full rounded-[0.5px] ${barColor}`}
+                        className={`h-full ${barColor}`}
                       />
                     )}
                   </div>

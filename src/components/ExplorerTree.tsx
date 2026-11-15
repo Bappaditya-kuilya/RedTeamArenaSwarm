@@ -25,7 +25,7 @@ export function ExplorerTree({
   return (
     <div role={depth === 0 ? 'tree' : 'group'}>
       {nodes.map((node) => {
-        const paddingLeft = 10 + depth * 12;
+        const paddingLeft = 8 + depth * 10;
 
         if (node.kind === 'folder') {
           const isOpen = expandedFolders.has(node.path);
@@ -37,29 +37,29 @@ export function ExplorerTree({
                 aria-expanded={isOpen}
                 onClick={() => onToggleFolder(node.path)}
                 style={{ paddingLeft }}
-                className="w-full h-[24px] pr-2 text-left text-[12px] flex items-center justify-between gap-1.5 text-[#30343A] hover:bg-[#F1F3F5] rounded-[4px] transition-colors"
+                className="w-full h-[22px] pr-2 text-left text-[13px] flex items-center justify-between gap-1.5 text-[#cccccc] hover:bg-[#2a2d2e] transition-colors"
               >
                 <span className="flex items-center gap-1 min-w-0">
                   {isOpen ? (
-                    <ChevronDown className="w-3.5 h-3.5 text-[#6B7078] shrink-0" aria-hidden="true" />
+                    <ChevronDown className="w-4 h-4 text-[#cccccc] shrink-0" strokeWidth={1.5} aria-hidden="true" />
                   ) : (
-                    <ChevronRight className="w-3.5 h-3.5 text-[#6B7078] shrink-0" aria-hidden="true" />
+                    <ChevronRight className="w-4 h-4 text-[#cccccc] shrink-0" strokeWidth={1.5} aria-hidden="true" />
                   )}
                   <VsCodeFolderIcon expanded={isOpen} />
                   <span
-                    className={`truncate font-medium ${
+                    className={`truncate ${
                       node.hasAdded
-                        ? 'text-[#14AE5C]'
+                        ? 'text-[#81b88b]'
                         : node.hasModified
-                        ? 'text-[#D97706]'
-                        : 'text-[#121417]'
+                        ? 'text-[#e2c08d]'
+                        : 'text-[#cccccc]'
                     }`}
                   >
                     {node.name}
                   </span>
                 </span>
                 {node.errorCount > 0 && (
-                  <span className="text-[10.5px] font-mono font-semibold text-[#F24822] tabular-nums shrink-0">
+                  <span className="text-[11px] font-mono text-[#f14c4c] tabular-nums shrink-0">
                     {node.errorCount}
                   </span>
                 )}
@@ -68,8 +68,8 @@ export function ExplorerTree({
                 <div className="relative">
                   <span
                     aria-hidden="true"
-                    style={{ left: paddingLeft + 6 }}
-                    className="absolute top-0 bottom-0 w-px bg-[#E0E2E5]"
+                    style={{ left: paddingLeft + 7 }}
+                    className="absolute top-0 bottom-0 w-px bg-[#404040]"
                   />
                   <ExplorerTree
                     nodes={node.children}
@@ -92,15 +92,13 @@ export function ExplorerTree({
             a.filePath === node.path &&
             ['scanning', 'navigating', 'writing', 'editing', 'verifying'].includes(a.status)
         );
-        const nameColor = isSelected
-          ? 'text-[#0D99FF] font-medium'
-          : node.gitStatus === 'A'
-          ? 'text-[#14AE5C]'
+        const nameColor = node.gitStatus === 'A'
+          ? 'text-[#81b88b]'
           : node.gitStatus === 'M'
-          ? 'text-[#D97706]'
+          ? 'text-[#e2c08d]'
           : node.errorCount > 0
-          ? 'text-[#F24822]'
-          : 'text-[#30343A]';
+          ? 'text-[#f48771]'
+          : 'text-[#cccccc]';
 
         return (
           <button
@@ -109,12 +107,12 @@ export function ExplorerTree({
             role="treeitem"
             aria-selected={isSelected}
             onClick={() => onSelectFile(node.path)}
-            style={{ paddingLeft: paddingLeft + 16 }}
+            style={{ paddingLeft: paddingLeft + 18 }}
             title={node.path}
-            className={`w-full h-[24px] pr-2 text-left text-[12px] flex items-center justify-between gap-2 rounded-[4px] transition-colors ${
+            className={`w-full h-[22px] pr-2 text-left text-[13px] flex items-center justify-between gap-2 transition-colors ${
               isSelected
-                ? 'bg-[#E6F4FF] text-[#0D99FF]'
-                : 'text-[#30343A] hover:bg-[#F1F3F5]'
+                ? 'bg-[#37373d] text-[#ffffff]'
+                : 'hover:bg-[#2a2d2e]'
             }`}
           >
             <span className="flex items-center gap-1.5 min-w-0">
@@ -122,7 +120,7 @@ export function ExplorerTree({
               <span className={`truncate ${nameColor}`}>{node.name}</span>
             </span>
 
-            <span className="flex items-center gap-1.5 shrink-0 font-mono text-[10px] tabular-nums">
+            <span className="flex items-center gap-1.5 shrink-0 font-mono text-[11px] tabular-nums">
               {workingAgent && (
                 <span
                   className="w-2 h-2 rounded-full animate-pulse"
@@ -131,17 +129,17 @@ export function ExplorerTree({
                 />
               )}
               {node.gitStatus === 'A' && (
-                <span className="text-[#14AE5C] font-bold" title="Added / New File">
+                <span className="text-[#81b88b] font-semibold" title="Added / New File">
                   A
                 </span>
               )}
               {node.gitStatus === 'M' && (
-                <span className="text-[#D97706] font-bold" title="Modified">
+                <span className="text-[#e2c08d] font-semibold" title="Modified">
                   M
                 </span>
               )}
               {node.errorCount > 0 && (
-                <span className="text-[#F24822] font-semibold">{node.errorCount}</span>
+                <span className="text-[#f14c4c]">{node.errorCount}</span>
               )}
             </span>
           </button>

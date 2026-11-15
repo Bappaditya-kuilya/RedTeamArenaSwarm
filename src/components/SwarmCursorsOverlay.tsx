@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import type { CursorAgentState, CursorSpeed } from '../types/ide';
+import { SWARM_CURSOR_PROFILES } from '../engine/swarmProfiles';
 
 interface SwarmCursorsOverlayProps {
   agents: CursorAgentState[];
@@ -16,42 +17,123 @@ interface CursorSimState {
   vx: number;
   vy: number;
   angle: number;
-  press: number;
   phase: number;
-  radiusX: number;
-  radiusY: number;
-  freqX: number;
-  freqY: number;
+  orbit: number;
+  curl: number;
+  speed: number;
+  force: number;
+  press: number;
+  spin: number;
+  animLine: number;
+  animCol: number;
 }
 
 interface RenderedCursor {
   id: string;
-  name: string;
   color: string;
   x: number;
   y: number;
   angle: number;
   scale: number;
-  isActive: boolean;
-  isWriting: boolean;
-  showBox: boolean;
-  task: string;
-  line: number;
-  boxWidth?: number;
-  boxHeight?: number;
-  boxLeft?: number;
-  boxTop?: number;
+  status: CursorAgentState['status'];
+  press: number;
 }
 
-// Exact SVG pointer geometry from califa/swarm-site
 const SWARM_ARROW_PATH =
   'M4.6 3.9 C4.2 3.1 4.9 2.4 5.7 2.8 L20.6 9.4 C21.5 9.8 21.4 11.1 20.4 11.3 L13.9 12.9 C13.4 13 13 13.4 12.9 13.9 L11.3 20.4 C11.1 21.4 9.8 21.5 9.4 20.6 Z';
 
-const ROAM_SPEED_FACTOR: Record<CursorSpeed, number> = {
-  slow: 0.42,
-  normal: 0.78,
+const POINTER_KEEPOUT_PX = 48;
+const SPEED_FACTOR: Record<CursorSpeed, number> = {
+  slow: 0.75,
+  normal: 1,
   fast: 1.35,
 };
+
+const ACTIVE_STATUSES = new Set([
+  'scanning',
+  'navigating',
+  'writing',
+  'editing',
+  'verifying',
+]);
+
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+function getWorkTarget(
+  container: HTMLElement,
+  activeFilePath: string,
+  agent: CursorAgentState | undefined,
+  slotIdx: number,
+  tSec: number,
+  animLine?: number,
+  animCol?: number,
+  forceActiveWork = false,
+): { x: number; y: number; press: number } | null {
+  if (!activeFilePath) return null;
+
+  const pane = container.querySelector<HTMLElement>('[data-editor-pane="primary"]');
+  if (!pane) return null;
+  const paneRect = pane.getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  const relPane = {
+    left: paneRect.left - containerRect.left,
+    top: paneRect.top - containerRect.top,
+    width: paneRect.width,
+    height: paneRect.height,
+  };
+
+  const line = Math.max(1, Math.round(animLine ?? agent?.line ?? 1));
+  const col = Math.max(1, animCol ?? agent?.column ?? 1);
+  const rawStatus = agent?.status ?? 'scanning';
+  const isWorkStatus = rawStatus === 'scanning' || rawStatus === 'navigating' || rawStatus === 'writing' || rawStatus === 'editing' || rawStatus === 'verifying';
+  // During active fix, never let cursors look idle/stuck - show them working
+  const status = forceActiveWork && !isWorkStatus ? (slotIdx % 3 === 0 ? 'writing' : 'scanning') : rawStatus;
+
+  const lineEl =
+    pane.querySelector<HTMLElement>(`[data-line="${line}"]`) ??
+    pane.querySelector<HTMLElement>('[data-line]');
+  if (!lineEl) {
+    const fx = relPane.left + relPane.width * 0.55 + (slotIdx - 4.5) * 10;
+    const fy = relPane.top + relPane.height * 0.35 + (slotIdx - 4.5) * 14;
+    return { x: fx, y: fy, press: 0.12 };
+  }
+
+  const lineRect = lineEl.getBoundingClientRect();
+  const baseX = lineRect.left - containerRect.left + 88 + Math.min(col - 1, 90) * 6.2;
+  const baseY = lineRect.top - containerRect.top + lineRect.height * 0.52;
+
+  const p = tSec * 2.1 + slotIdx * 0.83;
+  let ox = (slotIdx - 4.5) * 3.2;
+  let oy = ((slotIdx % 3) - 1) * 2.2;
+  let press = 0.04;
+
+  if (status === 'scanning') {
+    ox += Math.sin(p * 0.6) * 5;
+    oy += Math.cos(p * 0.5 + slotIdx) * 3;
+    press = 0.05 + 0.04 * Math.max(0, Math.sin(p * 0.8));
+  } else if (status === 'navigating') {
+    ox += Math.sin(p * 0.9) * 4;
+    oy += Math.cos(p * 1.0) * 2;
+    press = 0.07;
+  } else if (status === 'writing' || status === 'editing') {
+    ox += Math.sin(p * 2.4) * 1.5;
+    oy += Math.sin(p * 3.8) * 0.8;
+    press = 0.32 + 0.48 * Math.max(0, Math.sin(p * 5.4 + slotIdx * 0.22));
+  } else if (status === 'verifying') {
+    ox += Math.sin(p * 0.5) * 4;
+    oy += Math.cos(p * 0.45) * 2;
+    press = 0.1 + 0.05 * Math.max(0, Math.sin(p * 1.1));
+  } else {
+    // fallback: show as active typing/scanning, never standing still
+    ox += Math.sin(p * 2.2) * 2;
+    oy += Math.sin(p * 3.4) * 1;
+    press = 0.25 + 0.35 * Math.max(0, Math.sin(p * 4.8 + slotIdx * 0.2));
+  }
+
+  const x = clamp(baseX + ox, relPane.left + 28, relPane.left + relPane.width - 20);
+  const y = clamp(baseY + oy, relPane.top + 36, relPane.top + relPane.height - 20);
+  return { x, y, press };
+}
 
 export function SwarmCursorsOverlay({
   agents,
@@ -70,30 +152,41 @@ export function SwarmCursorsOverlay({
   taskRunningRef.current = isTaskRunning;
   const speedRef = useRef(speed);
   speedRef.current = speed;
-  const mouseRef = useRef<{ x: number; y: number; activeAt: number } | null>(null);
+  const pointerRef = useRef<{ x: number; y: number } | null>(null);
+  const mouseVelRef = useRef({ x: 0, y: 0 });
+  const smoothedVelRef = useRef({ x: 0, y: 0 });
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
-    const handleMove = (e: MouseEvent) => {
+    const handleMove = (e: PointerEvent) => {
       const rect = container.getBoundingClientRect();
-      mouseRef.current = {
-        x: e.clientX - rect.left,
-        y: e.clientY - rect.top,
-        activeAt: performance.now(),
-      };
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const prev = lastPointerRef.current;
+      if (prev) {
+        mouseVelRef.current.x = (x - prev.x) * 60;
+        mouseVelRef.current.y = (y - prev.y) * 60;
+      }
+      lastPointerRef.current = { x, y };
+      pointerRef.current = { x, y };
     };
-
     const handleLeave = () => {
-      mouseRef.current = null;
+      pointerRef.current = null;
+      lastPointerRef.current = null;
+      mouseVelRef.current.x = 0;
+      mouseVelRef.current.y = 0;
     };
 
-    container.addEventListener('mousemove', handleMove, { passive: true });
-    container.addEventListener('mouseleave', handleLeave);
+    container.addEventListener('pointermove', handleMove, { passive: true });
+    container.addEventListener('pointerleave', handleLeave);
+    container.addEventListener('pointercancel', handleLeave);
     return () => {
-      container.removeEventListener('mousemove', handleMove);
-      container.removeEventListener('mouseleave', handleLeave);
+      container.removeEventListener('pointermove', handleMove);
+      container.removeEventListener('pointerleave', handleLeave);
+      container.removeEventListener('pointercancel', handleLeave);
     };
   }, [containerRef]);
 
@@ -102,184 +195,312 @@ export function SwarmCursorsOverlay({
     let lastTime = performance.now();
 
     const step = (now: number) => {
-      const dt = Math.min(0.05, Math.max(0.004, (now - lastTime) / 1000));
+      const dt = Math.min(0.05, Math.max(0.001, (now - lastTime) / 1000));
       lastTime = now;
 
       const container = containerRef.current;
-      const currentAgents = agentsRef.current;
-      if (!container || currentAgents.length === 0) {
+      if (!container) {
         rafId = requestAnimationFrame(step);
         return;
       }
-
       const rect = container.getBoundingClientRect();
-      const width = Math.max(320, rect.width);
-      const height = Math.max(240, rect.height);
+      const width = Math.max(240, rect.width);
+      const height = Math.max(200, rect.height);
       const tSec = now / 1000;
-      const speedFactor = ROAM_SPEED_FACTOR[speedRef.current] ?? 0.42;
-      const running = taskRunningRef.current;
-      const openFile = activeFileRef.current;
+      const speedFactor = SPEED_FACTOR[speedRef.current] ?? 1;
 
-      const editorPaneEl =
-        container.querySelector<HTMLElement>('[data-editor-pane="primary"]') ?? container;
-      const editorRect = editorPaneEl.getBoundingClientRect();
-      const editorRelLeft = editorRect.left - rect.left;
-      const editorRelTop = editorRect.top - rect.top;
-      const editorWidth = Math.max(240, editorRect.width);
-      const editorHeight = Math.max(180, editorRect.height);
-      const editorCenterX = editorRelLeft + editorWidth * 0.48;
-      const editorCenterY = editorRelTop + editorHeight * 0.5;
+      // smoothed mouse velocity (tv, factor min(1,dt*18))
+      const tvFactor = Math.min(1, dt * 18);
+      const sv = smoothedVelRef.current;
+      const mv = mouseVelRef.current;
+      sv.x += (mv.x - sv.x) * tvFactor;
+      sv.y += (mv.y - sv.y) * tvFactor;
+      mv.x *= Math.exp(-dt * 10);
+      mv.y *= Math.exp(-dt * 10);
 
-      // Global flocking target anchored over the open editor canvas
-      const mouseRecent =
-        mouseRef.current && now - mouseRef.current.activeAt < 3500 ? mouseRef.current : null;
-      const clampedMouseX = mouseRecent
-        ? Math.max(editorRelLeft + 36, Math.min(editorRelLeft + editorWidth - 95, mouseRecent.x))
-        : editorCenterX;
-      const clampedMouseY = mouseRecent
-        ? Math.max(editorRelTop + 64, Math.min(editorRelTop + editorHeight - 36, mouseRecent.y))
-        : editorCenterY;
+      const currentAgents = agentsRef.current.slice(0, 10);
+      // Exactly 10 cursors
+      const cursorSlots = SWARM_CURSOR_PROFILES.slice(0, 10).map((profile, idx) => ({
+        profile,
+        agent: currentAgents.find((a) => a.id === profile.id) ?? currentAgents[idx],
+      }));
 
-      const flockCenterX = mouseRecent
-        ? clampedMouseX
-        : editorCenterX + Math.sin(tSec * 0.42 * speedFactor) * Math.min(190, editorWidth * 0.28);
-      const flockCenterY = mouseRecent
-        ? clampedMouseY
-        : editorCenterY + Math.cos(tSec * 0.57 * speedFactor + 0.8) * Math.min(130, editorHeight * 0.26);
+      const taskRunning = taskRunningRef.current;
+      const hasActiveWork =
+        taskRunning &&
+        !!activeFileRef.current &&
+        (currentAgents.some(
+          (a) =>
+            ACTIVE_STATUSES.has(a.status) &&
+            (!a.filePath || a.filePath === activeFileRef.current),
+        ) || currentAgents.length > 0);
 
-      const lineNodes = running
-        ? Array.from(editorPaneEl.querySelectorAll<HTMLElement>('[data-line]'))
-        : [];
-      const lineElMap = new Map<number, HTMLElement>();
-      for (const el of lineNodes) {
-        const ln = Number(el.dataset.line);
-        if (ln > 0) lineElMap.set(ln, el);
-      }
+      const pointer = pointerRef.current;
+      const lissajous = {
+        x: width * 0.5 + Math.sin(tSec * 0.7) * width * 0.22 + Math.sin(tSec * 0.33) * 40,
+        y: height * 0.5 + Math.sin(tSec * 0.9 + 1.2) * height * 0.18 + Math.cos(tSec * 0.41) * 30,
+      };
 
-      const nextRendered: RenderedCursor[] = [];
-      let renderedBoxes = 0;
+      const ringBase = 135 * (1 + 0.18 * Math.sin(tSec * 0.55));
+      const swirl = Math.tanh(Math.cos(tSec * 0.11) * 3);
 
-      for (let idx = 0; idx < currentAgents.length; idx++) {
-        const agent = currentAgents[idx];
-        let sim = simMapRef.current.get(agent.id);
+      const desired: Array<{ x: number; y: number; press: number }> = [];
+
+      for (let idx = 0; idx < cursorSlots.length; idx++) {
+        const { profile, agent } = cursorSlots[idx];
+        let sim = simMapRef.current.get(profile.id);
         if (!sim) {
-          const ringAngle = (idx / Math.max(1, currentAgents.length)) * Math.PI * 2;
+          const baseAngle = (idx / 10) * Math.PI * 2;
           sim = {
-            x: editorCenterX + Math.cos(ringAngle) * Math.min(170, editorWidth * 0.28),
-            y: editorCenterY + Math.sin(ringAngle) * Math.min(130, editorHeight * 0.25),
+            x: lissajous.x + Math.cos(baseAngle) * (ringBase + 30),
+            y: lissajous.y + Math.sin(baseAngle) * (ringBase + 30),
             vx: 0,
             vy: 0,
             angle: 0,
+            phase: baseAngle + idx * 0.618,
+            orbit: 70 + (idx % 5) * 22,
+            curl: ((idx % 3) - 1) * 0.55,
+            speed: 320 + (idx % 4) * 90,
+            force: 900 + (idx % 5) * 180,
             press: 0,
-            phase: ringAngle + idx * 0.618,
-            radiusX: 54 + (idx % 5) * 34,
-            radiusY: 40 + ((idx * 3) % 5) * 26,
-            freqX: 0.38 + (idx % 7) * 0.06,
-            freqY: 0.49 + ((idx + 2) % 6) * 0.06,
+            spin: 0.8 + (idx % 4) * 0.25,
+            animLine: agent?.line ?? 1,
+            animCol: agent?.column ?? 1,
           };
-          simMapRef.current.set(agent.id, sim);
+          simMapRef.current.set(profile.id, sim);
         }
 
-        const isWorkingStatus = ['scanning', 'navigating', 'writing', 'editing', 'verifying'].includes(
-          agent.status
-        );
-        const isWriting = agent.status === 'writing' || agent.status === 'editing';
+        // Animate work position. During active fix, keep ALL cursors moving (no one stands still).
+        const effectiveAgent = agent;
+        const status = effectiveAgent?.status ?? 'scanning';
+        const isWorkStatus = status === 'writing' || status === 'editing' || status === 'scanning' || status === 'navigating' || status === 'verifying';
+        const workingNow = hasActiveWork;
 
-        let targetX = sim.x;
-        let targetY = sim.y;
-        let showBox = false;
-        let boxWidth: number | undefined;
-        let boxHeight: number | undefined;
-        let boxLeft: number | undefined;
-        let boxTop: number | undefined;
+        let targetLine = Math.max(1, effectiveAgent?.line ?? 1);
+        let targetCol = Math.max(1, effectiveAgent?.column ?? 1);
 
-        if (running && isWorkingStatus) {
-          const targetLineEl =
-            (agent.filePath === openFile ? lineElMap.get(agent.line) : undefined) ??
-            lineElMap.get(Math.max(1, (idx % Math.max(1, lineElMap.size)) + 1)) ??
-            lineNodes[idx % Math.max(1, lineNodes.length)];
-
-          if (targetLineEl) {
-            const lRect = targetLineEl.getBoundingClientRect();
-            // Stagger horizontal positions cleanly across the line when multiple cursors share the file
-            const baseCol = Math.max(4, agent.column - 1);
-            const spreadCol = isWriting ? baseCol : (baseCol + ((idx * 11) % 42));
-            const codeTextOffset = 58 + Math.min(editorWidth - 150, spreadCol * 7.4);
-            targetX = lRect.left - rect.left + codeTextOffset;
-            targetY = lRect.top - rect.top + Math.min(lRect.height * 0.55, 11);
-
-            if ((isWriting || idx === 0) && renderedBoxes < 3) {
-              renderedBoxes++;
-              showBox = true;
-              boxLeft = lRect.left - rect.left + 48;
-              boxTop = lRect.top - rect.top;
-              boxWidth = Math.min(Math.max(140, editorWidth - 110), 460);
-              boxHeight = Math.max(20, lRect.height);
-            }
+        if (workingNow) {
+          // If agent is idle/done/stuck with no updates, assign synthetic active work so it looks like writing/fixing
+          const syntheticBaseLine = Math.max(1, (currentAgents.find((a) => ACTIVE_STATUSES.has(a.status))?.line ?? targetLine));
+          if (!effectiveAgent || !isWorkStatus) {
+            // cycle through "helping" roles: some write/type, some scan nearby lines
+            const role = idx % 3;
+            const sweep = (tSec * (0.35 + (idx % 4) * 0.07) + idx * 0.9);
+            targetLine = Math.max(1, syntheticBaseLine + ((idx % 7) - 3) + Math.floor(Math.sin(sweep) * 2));
+            targetCol = 8 + ((idx * 9 + Math.floor(tSec * (role === 0 ? 10 : 5))) % 55);
           } else {
-            const spreadAngle = (idx / Math.max(1, currentAgents.length)) * Math.PI * 2;
-            targetX = editorCenterX + Math.cos(spreadAngle + tSec * 0.4) * Math.min(150, editorWidth * 0.25);
-            targetY = editorCenterY + Math.sin(spreadAngle + tSec * 0.4) * Math.min(100, editorHeight * 0.22);
+            // keep reported target but ensure continuous progress
+            targetLine = Math.max(1, targetLine);
+            targetCol = Math.max(1, targetCol);
           }
-        } else {
-          const tMove = tSec * speedFactor;
-          const orbitAngle = sim.phase + tMove * (0.45 + (idx % 4) * 0.08);
-          const localDriftX = Math.cos(orbitAngle * sim.freqX) * sim.radiusX;
-          const localDriftY = Math.sin(orbitAngle * sim.freqY + idx * 0.4) * sim.radiusY;
-          const flockPull = mouseRecent ? 0.55 : 0.35;
-
-          const homeX = editorCenterX + Math.cos(sim.phase) * Math.min(editorWidth * 0.3, 210);
-          const homeY = editorCenterY + Math.sin(sim.phase) * Math.min(editorHeight * 0.28, 150);
-
-          targetX = homeX * (1 - flockPull) + flockCenterX * flockPull + localDriftX;
-          targetY = homeY * (1 - flockPull) + flockCenterY * flockPull + localDriftY;
-
-          // Keep roaming comfortably inside the open editor / workspace canvas without covering right buttons
-          const minX = Math.max(24, editorRelLeft + 18);
-          const maxX = Math.min(width - 100, editorRelLeft + editorWidth - 90);
-          const minY = Math.max(76, editorRelTop + 62);
-          const maxY = Math.min(height - 40, editorRelTop + editorHeight - 30);
-          targetX = Math.max(minX, Math.min(Math.max(minX + 40, maxX), targetX));
-          targetY = Math.max(minY, Math.min(Math.max(minY + 40, maxY), targetY));
         }
 
-        const stiffness = running ? 11.5 : 4.2 * Math.max(0.75, speedFactor);
-        const damping = running ? 0.78 : 0.85;
-        const ax = (targetX - sim.x) * stiffness;
-        const ay = (targetY - sim.y) * stiffness;
-
-        sim.vx = (sim.vx + ax * dt) * Math.pow(damping, dt * 60);
-        sim.vy = (sim.vy + ay * dt) * Math.pow(damping, dt * 60);
-        sim.x += sim.vx * dt * 10;
-        sim.y += sim.vy * dt * 10;
-
-        const desiredAngle = Math.max(-14, Math.min(14, sim.vx * 0.45));
-        sim.angle += (desiredAngle - sim.angle) * Math.min(1, dt * 12);
-
-        if (isWriting) {
-          sim.press = 0.5 + 0.5 * Math.sin(tSec * 14 + idx);
-        } else {
-          sim.press = Math.max(0, sim.press - dt * 4);
+        const lineDiff = targetLine - sim.animLine;
+        sim.animLine += clamp(lineDiff, -dt * (workingNow ? 14 : 18), dt * (workingNow ? 14 : 18));
+        if (Math.abs(lineDiff) > 0.6) {
+          sim.animCol += (2 - sim.animCol) * Math.min(1, dt * 6);
         }
 
-        nextRendered.push({
-          id: agent.id,
-          name: agent.name,
-          color: agent.color,
+        const colDiff = targetCol - sim.animCol;
+        if (workingNow && (!isWorkStatus || status === 'navigating')) {
+          // synthetic/helper typing motion - looks like actively writing/fixing
+          const typeRate = 8 + (idx % 5) * 1.5;
+          if (Math.abs(colDiff) > 0.3) sim.animCol += clamp(colDiff, -dt * 18, dt * 18);
+          sim.animCol += dt * typeRate * (0.55 + 0.45 * Math.max(0, Math.sin(tSec * 5.2 + idx * 0.7)));
+          if (sim.animCol > 70) sim.animCol = 6 + (idx % 8);
+        } else if (status === 'writing' || status === 'editing') {
+          const typeRate = 10 * speedFactor;
+          if (colDiff > 0.2) sim.animCol += Math.min(colDiff, dt * (12 + colDiff * 6));
+          else sim.animCol += dt * typeRate * (0.6 + 0.4 * Math.max(0, Math.sin(tSec * 6 + idx)));
+          if (workingNow && Math.abs(colDiff) < 0.25) sim.animCol += dt * typeRate * 0.35; // never stand still while writing
+        } else if (status === 'scanning') {
+          if (Math.abs(colDiff) > 0.2) sim.animCol += clamp(colDiff, -dt * 20, dt * 20);
+          sim.animCol += dt * (workingNow ? 5 : 3) * (0.5 + 0.5 * Math.sin(tSec * 1.2 + idx));
+        } else if (status === 'verifying') {
+          if (Math.abs(colDiff) > 0.2) sim.animCol += clamp(colDiff, -dt * 16, dt * 16);
+          sim.animCol += dt * (workingNow ? 3.5 : 1.5) * (0.5 + 0.5 * Math.sin(tSec * 1.4 + idx));
+        } else {
+          if (workingNow) {
+            // any other state during active task: keep moving like writing/scanning
+            sim.animCol += dt * (6 + (idx % 4)) * (0.5 + 0.5 * Math.max(0, Math.sin(tSec * 4.8 + idx)));
+            if (sim.animCol > 65) sim.animCol = 5 + (idx % 10);
+          } else {
+            sim.animCol += clamp(colDiff, -dt * 16, dt * 16);
+          }
+        }
+        sim.animLine = clamp(sim.animLine, 1, 9999);
+        sim.animCol = clamp(sim.animCol, 1, 140);
+
+        let target = hasActiveWork ? lissajous : (pointer ?? lissajous);
+        let targetPress = 0;
+        if (hasActiveWork) {
+          const pane = container.querySelector<HTMLElement>('[data-editor-pane="primary"]');
+          const paneRect = pane?.getBoundingClientRect();
+          const containerRect = container.getBoundingClientRect();
+          const workFallback = paneRect
+            ? {
+                x: (paneRect.left - containerRect.left) + paneRect.width * 0.55 + (idx - 4.5) * 8,
+                y: (paneRect.top - containerRect.top) + paneRect.height * 0.4 + (idx % 5) * 18,
+              }
+            : lissajous;
+          target = workFallback;
+          const wt = getWorkTarget(container, activeFileRef.current, agent, idx, tSec, sim.animLine, sim.animCol, true);
+          if (wt) {
+            target = { x: wt.x, y: wt.y };
+            targetPress = wt.press;
+          }
+        } else if (!pointer) {
+          target = lissajous;
+        }
+
+        const dx = sim.x - target.x;
+        const dy = sim.y - target.y;
+        const dist = Math.hypot(dx, dy) || 0.01;
+        const nx = dx / dist;
+        const ny = dy / dist;
+        const ang = Math.atan2(dy, dx);
+
+        let dvx = 0;
+        let dvy = 0;
+        if (hasActiveWork) {
+          // Purposeful work motion: move directly to task target (like building/fixing), minimal orbit/roam
+          const workDesiredDist = 10 + (idx % 3) * 3;
+          const radial = clamp((workDesiredDist - dist) * 7, -3200, 2200);
+          const tangential = Math.sin(tSec * 1.6 + sim.phase) * 18 * speedFactor;
+          dvx = nx * radial - ny * tangential;
+          dvy = ny * radial + nx * tangential;
+        } else {
+          // Swarm-site-style flock/orbit around target
+          const orbitBias = (sim.orbit - 120) * 0.45;
+          const desiredDist = ringBase + orbitBias + 16 * Math.sin(3 * ang + tSec * 0.7 + sim.phase);
+          const tangential = 260 * (0.7 + sim.spin * 0.15) * swirl * speedFactor;
+          const radial = clamp((desiredDist - dist) * 4, -2600, 1400);
+          const proximity = clamp((dist - desiredDist) / 600, 0, 1);
+          dvx = -ny * tangential + nx * radial - ny * sim.curl * 320 * proximity;
+          dvy = nx * tangential + ny * radial + nx * sim.curl * 320 * proximity;
+        }
+        desired.push({ x: dvx, y: dvy, press: targetPress });
+      }
+
+      // Steering integration with neighbor alignment within 90px (70/30), speed/force caps and distance boost, Euler integration
+      const ids = cursorSlots.map((s) => s.profile.id);
+      for (let i = 0; i < cursorSlots.length; i++) {
+        const id = ids[i];
+        const sim = simMapRef.current.get(id)!;
+
+        let avx = 0;
+        let avy = 0;
+        let neighbors = 0;
+        for (let j = 0; j < cursorSlots.length; j++) {
+          if (i === j) continue;
+          const other = simMapRef.current.get(ids[j])!;
+          const d = Math.hypot(other.x - sim.x, other.y - sim.y);
+          if (d > 90) continue;
+          const w = 1 - d / 90;
+          avx += other.vx * w;
+          avy += other.vy * w;
+          neighbors += w;
+        }
+
+        let ax = desired[i].x;
+        let ay = desired[i].y;
+        if (neighbors > 0) {
+          // In work mode stay goal-directed; in idle keep flock cohesion
+          const targetW = hasActiveWork ? 0.92 : 0.7;
+          const neighW = hasActiveWork ? 0.08 : 0.3;
+          ax = ax * targetW + (avx / neighbors) * neighW;
+          ay = ay * targetW + (avy / neighbors) * neighW;
+        }
+
+        // press decay dt*6 and apply
+        sim.press = Math.max(0, sim.press - dt * 6);
+        sim.press = Math.max(sim.press, desired[i].press);
+
+        const boostAgent = cursorSlots[i]?.agent;
+        const targetForBoost = hasActiveWork
+          ? getWorkTarget(container, activeFileRef.current, boostAgent, i, tSec, sim.animLine, sim.animCol, true) ?? lissajous
+          : pointer ?? lissajous;
+        const away = Math.max(0, Math.hypot(sim.x - targetForBoost.x, sim.y - targetForBoost.y) - 180);
+        const maxSpeed = sim.speed * speedFactor * (1.25 + Math.min(3.0, away / 90));
+        const speedMag = Math.hypot(ax, ay);
+        if (speedMag > maxSpeed) {
+          ax *= maxSpeed / speedMag;
+          ay *= maxSpeed / speedMag;
+        }
+
+        let steerX = (ax - sim.vx) * 6;
+        let steerY = (ay - sim.vy) * 6;
+        const maxForce = sim.force * speedFactor * (1.3 + Math.min(4.5, away / 55));
+        const steerMag = Math.hypot(steerX, steerY);
+        if (steerMag > maxForce) {
+          steerX *= maxForce / steerMag;
+          steerY *= maxForce / steerMag;
+        }
+
+        sim.vx += steerX * dt;
+        sim.vy += steerY * dt;
+        sim.x += sim.vx * dt;
+        sim.y += sim.vy * dt;
+
+        // 48px keepout ring with outward impulse/damping (around pointer when following mouse; around target in idle mouse follow)
+        const keepoutCenter = !hasActiveWork && pointer ? pointer : null;
+        if (keepoutCenter) {
+          const kdx = sim.x - keepoutCenter.x;
+          const kdy = sim.y - keepoutCenter.y;
+          const kdist = Math.hypot(kdx, kdy) || 0.01;
+          if (kdist < POINTER_KEEPOUT_PX) {
+            const knx = kdx / kdist;
+            const kny = kdy / kdist;
+            sim.x = keepoutCenter.x + knx * POINTER_KEEPOUT_PX;
+            sim.y = keepoutCenter.y + kny * POINTER_KEEPOUT_PX;
+            const inward = (sim.vx - sv.x) * knx + (sim.vy - sv.y) * kny;
+            if (inward < 0) {
+              sim.vx -= knx * inward * 1.6;
+              sim.vy -= kny * inward * 1.6;
+            }
+            sim.vx += knx * 220;
+            sim.vy += kny * 220;
+          }
+        }
+
+        const pad = 18;
+        if (sim.x < -pad) sim.x = -pad;
+        if (sim.y < -pad) sim.y = -pad;
+        if (sim.x > width + pad) sim.x = width + pad;
+        if (sim.y > height + pad) sim.y = height + pad;
+
+        const vmag = Math.hypot(sim.vx, sim.vy);
+        if (vmag >= 25) {
+          const desiredAngle = (Math.atan2(sim.vy, sim.vx) * 180) / Math.PI + 128;
+          let delta = ((desiredAngle - sim.angle + 540) % 360) - 180;
+          sim.angle += delta * Math.min(1, dt * 8);
+        }
+      }
+
+      const nextRendered: RenderedCursor[] = cursorSlots.map(({ profile, agent }) => {
+        const sim = simMapRef.current.get(profile.id)!;
+        const status = agent?.status ?? 'idle';
+        const isTyping = status === 'writing' || status === 'editing';
+        const isActive = ACTIVE_STATUSES.has(status);
+        const pressDip = isTyping ? 0.13 : isActive ? 0.1 : 0.07;
+        return {
+          id: profile.id,
+          color: profile.color,
           x: Math.round(sim.x * 10) / 10,
           y: Math.round(sim.y * 10) / 10,
           angle: Math.round(sim.angle * 10) / 10,
-          scale: 1 - sim.press * 0.1,
-          isActive: running && isWorkingStatus,
-          isWriting,
-          showBox,
-          task: agent.task,
-          line: agent.line,
-          boxLeft,
-          boxTop,
-          boxWidth,
-          boxHeight,
-        });
+          scale: 1 - Math.min(isTyping ? 0.16 : 0.12, sim.press * pressDip),
+          status,
+          press: sim.press,
+        };
+      });
+
+      // Drop stale sims if profiles changed (unlikely)
+      if (simMapRef.current.size > cursorSlots.length) {
+        const live = new Set(ids);
+        for (const id of simMapRef.current.keys()) {
+          if (!live.has(id)) simMapRef.current.delete(id);
+        }
       }
 
       setRenderedCursors(nextRendered);
@@ -291,73 +512,85 @@ export function SwarmCursorsOverlay({
   }, [containerRef]);
 
   return (
-    <div
-      aria-hidden="true"
-      className="pointer-events-none absolute inset-0 z-30 overflow-hidden"
-    >
-      {/* Active Figma-style selection rectangles (capped cleanly to writing/lead cursors) */}
-      {renderedCursors.map((c) =>
-        c.showBox && c.boxLeft !== undefined && c.boxTop !== undefined && c.boxWidth && c.boxHeight ? (
-          <div
-            key={`${c.id}-box`}
-            style={{
-              transform: `translate3d(${c.boxLeft}px, ${c.boxTop}px, 0)`,
-              width: `${c.boxWidth}px`,
-              height: `${c.boxHeight}px`,
-              borderColor: c.isWriting ? '#0D99FF' : c.color,
-              backgroundColor: c.isWriting ? 'rgba(13, 153, 255, 0.08)' : 'transparent',
-            }}
-            className="absolute top-0 left-0 border pointer-events-none transition-[width,height] duration-150"
-          >
-            <span className="absolute -top-[3px] -left-[3px] w-[5px] h-[5px] bg-white border border-[#0D99FF]" />
-            <span className="absolute -top-[3px] -right-[3px] w-[5px] h-[5px] bg-white border border-[#0D99FF]" />
-            <span className="absolute -bottom-[3px] -left-[3px] w-[5px] h-[5px] bg-white border border-[#0D99FF]" />
-            <span className="absolute -bottom-[3px] -right-[3px] w-[5px] h-[5px] bg-white border border-[#0D99FF]" />
-          </div>
-        ) : null
-      )}
+    <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-30 overflow-hidden">
+      {renderedCursors.map((c) => {
+        const isTyping = c.status === 'writing' || c.status === 'editing';
+        const isScanning = c.status === 'scanning' || c.status === 'navigating';
+        const isVerifying = c.status === 'verifying';
+        const isActive = ACTIVE_STATUSES.has(c.status);
+        const isIdle = c.status === 'idle' || c.status === 'done' || c.status === 'error';
+        const stateClass = isTyping
+          ? 'swarm-cursor--typing'
+          : isScanning
+            ? 'swarm-cursor--scanning'
+            : isVerifying
+              ? 'swarm-cursor--verifying'
+              : isIdle
+                ? 'swarm-cursor--idle'
+                : 'swarm-cursor--active';
+        const pulse = isTyping ? 0.35 + Math.min(0.65, c.press * 1.4) : isActive ? 0.22 : 0;
+        const glow = isTyping
+          ? `0 0 0 ${3 + c.press * 4}px ${c.color}33, 0 0 10px ${c.color}55`
+          : isVerifying
+            ? `0 0 0 3px ${c.color}22, 0 0 8px ${c.color}44`
+            : isActive
+              ? `0 0 0 2px ${c.color}1f`
+              : 'none';
 
-      {/* All 20 Animated Figma-Style SVG Pointer Cursors */}
-      {renderedCursors.map((c) => (
-        <div
-          key={c.id}
-          data-swarm-cursor={c.id}
-          style={{
-            transform: `translate3d(${c.x}px, ${c.y}px, 0)`,
-            willChange: 'transform',
-          }}
-          className="absolute top-0 left-0"
-        >
-          <svg
-            width={26}
-            height={26}
-            viewBox="0 0 28 28"
-            className="swarm-pointer-svg block"
-            style={{
-              transform: `translate(-4px, -3px) rotate(${c.angle}deg) scale(${c.scale})`,
-              transformOrigin: '4px 3px',
-            }}
-          >
-            <path
-              d={SWARM_ARROW_PATH}
-              fill={c.color}
-              stroke="#FFFFFF"
-              strokeWidth={1.6}
-              strokeLinejoin="round"
-            />
-          </svg>
-
+        return (
           <div
-            style={{ backgroundColor: c.color }}
-            className="swarm-cursor-label absolute left-[14px] top-[15px] px-1.5 py-[1px] text-white flex items-center gap-1"
+            key={c.id}
+            data-swarm-cursor={c.id}
+            data-swarm-status={c.status}
+            style={{
+              transform: `translate3d(${c.x}px, ${c.y}px, 0)`,
+              willChange: 'transform',
+              opacity: c.status === 'error' ? 0.55 : c.status === 'done' || c.status === 'idle' ? 0.82 : 1,
+            }}
+            className="absolute top-0 left-0"
           >
-            <span>{c.name}</span>
-            {c.isActive && (
-              <span className="opacity-85 font-mono text-[9.5px]">:{c.line}</span>
-            )}
+            <div
+              className={`swarm-cursor-state ${stateClass}`}
+              style={{
+                transform: `translate(-5px, -4px) rotate(${c.angle}deg) scale(${c.scale})`,
+                transformOrigin: '5px 4px',
+              }}
+            >
+              {isActive && (
+                <span
+                  aria-hidden="true"
+                  className="swarm-cursor-halo"
+                  style={{
+                    backgroundColor: c.color,
+                    opacity: pulse,
+                    transform: `scale(${isTyping ? 1 + c.press * 0.25 : 1})`,
+                  }}
+                />
+              )}
+              <svg
+                width={30}
+                height={30}
+                viewBox="0 0 28 28"
+                className="swarm-pointer-svg block"
+                style={{
+                  filter:
+                    glow !== 'none'
+                      ? `drop-shadow(0 1px 1.5px rgba(18, 20, 23, 0.22)) drop-shadow(${glow})`
+                      : undefined,
+                }}
+              >
+                <path
+                  d={SWARM_ARROW_PATH}
+                  fill={c.color}
+                  stroke="#FFFFFF"
+                  strokeWidth={1.7}
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

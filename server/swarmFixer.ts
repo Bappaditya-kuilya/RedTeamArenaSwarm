@@ -257,6 +257,34 @@ async function countFileTscErrors(
   return count;
 }
 
+function isTestFilePath(filePath: string): boolean {
+  return /\.(test|spec)\.(js|mjs|cjs|ts|tsx)$/i.test(filePath);
+}
+
+async function runTargetedTestCheck(
+  workspaceDir: string,
+  filePath: string
+): Promise<{ ran: boolean; failed: number; exitCode: number }> {
+  if (!isTestFilePath(filePath)) return { ran: false, failed: 0, exitCode: 0 };
+  const hasTs = /\.tsx?$/i.test(filePath);
+  const tsxBin = path.resolve(process.cwd(), 'node_modules/.bin/tsx');
+  const cmd = hasTs ? tsxBin : 'node';
+  try {
+    await execFileAsync(cmd, ['--test', filePath], {
+      cwd: workspaceDir,
+      timeout: 15_000,
+      env: { ...process.env, NODE_ENV: 'test' },
+    });
+    return { ran: true, failed: 0, exitCode: 0 };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; code?: number };
+    const combined = [e.stdout, e.stderr].filter(Boolean).join('\n');
+    const failMatch = combined.match(/#\s*fail\s+(\d+)/i);
+    const failed = failMatch ? parseInt(failMatch[1], 10) : 1;
+    return { ran: true, failed, exitCode: typeof e.code === 'number' ? e.code : 1 };
+  }
+}
+
 const SPEED_MULTIPLIER: Record<CursorSpeed, number> = {
   slow: 1.0,
   normal: 0.55,
@@ -273,7 +301,7 @@ export async function runAutonomousSwarmFix(params: {
 }): Promise<void> {
   const { workspaceId, workspaceDir, useAi = true, speed = 'slow', emit } = params;
   const mult = SPEED_MULTIPLIER[speed] ?? 1.0;
-  const numAgents = Math.max(1, Math.min(20, params.agentCount ?? 20));
+  const numAgents = 10;
 
   const agents: CursorAgentState[] = SWARM_CURSOR_PROFILES.slice(0, numAgents).map((p) => ({
     id: p.id,
@@ -289,18 +317,21 @@ export async function runAutonomousSwarmFix(params: {
     createdCount: 0,
   }));
 
-  for (const a of agents) {
-    emit({ type: 'agent:update', agent: { ...a } });
-  }
+  const broadcast = (logLine?: string) => {
+    for (let i = 0; i < agents.length; i++) {
+      emit({ type: 'agent:update', agent: { ...agents[i] }, logLine: i === 0 ? logLine : undefined });
+    }
+  };
 
+  broadcast();
   emit({
     type: 'phase',
     phase: 'diagnosing',
-    message: `All ${numAgents} cursors scanning workspace with tsc --noEmit, tsx --test, bug AST, and security probes…`,
+    message: `All ${numAgents} cursors scanning workspace with tsc --noEmit, tests/checks, bug AST, security probes${useAi ? ', and AI patch synthesis' : ''}…`,
   });
 
   const initialFiles = await readAllTextFiles(workspaceDir);
-  const initialDebug = await runParallelDebugSwarm(workspaceDir, initialFiles.fileContents, false);
+  const initialDebug = await runParallelDebugSwarm(workspaceDir, initialFiles.fileContents, useAi);
   const tsFiles = Object.keys(initialFiles.fileContents).filter(
     (p) => /\.(ts|tsx)$/i.test(p) && !p.endsWith('.d.ts')
   );
@@ -314,9 +345,8 @@ export async function runAutonomousSwarmFix(params: {
 
   const fileQueues: Array<{ filePath: string; items: CodeDiagnostic[] }> = [];
   const byFile = new Map<string, CodeDiagnostic[]>();
-
   for (const d of initialDebug.diagnostics) {
-    if (d.fixed || d.code === 'TEST-FAIL') continue;
+    if (d.fixed) continue;
     const list = byFile.get(d.filePath) ?? [];
     list.push(d);
     byFile.set(d.filePath, list);
@@ -330,23 +360,16 @@ export async function runAutonomousSwarmFix(params: {
     for (const a of agents) {
       a.status = 'done';
       a.task = '0 issues to fix · Workspace clean';
-      emit({
-        type: 'agent:update',
-        agent: { ...a },
-        logLine: `[${a.name}] Codebase verified clean — 0 issues remaining.`,
-      });
     }
+    broadcast(`[Swarm] Codebase verified clean — 0 issues remaining.`);
     const gitDiff = await computeWorkspaceGitDiff(workspaceDir);
     emit({
       type: 'swarm:complete',
-      result: {
-        workspaceId,
-        ...initialDebug,
-        gitDiff,
-      },
+      result: { workspaceId, ...initialDebug, gitDiff },
       agents,
       fileContents: initialFiles.fileContents,
       fixedCount: 0,
+      summary: 'No fixable diagnostics found.',
     });
     return;
   }
@@ -354,258 +377,318 @@ export async function runAutonomousSwarmFix(params: {
   emit({
     type: 'phase',
     phase: 'fixing',
-    message: `Swarm converged: all ${numAgents} cursors working across ${fileQueues.length} file(s)…`,
+    message: `Swarm converged: all ${numAgents} cursors working one file at a time across ${fileQueues.length} file(s)…`,
   });
 
   const ai = useAi ? getGeminiClient() : null;
-  let totalFixed = 0;
-  const fixedByAgent = new Map<string, { agentId: string }>();
+  let verifiedFixCount = 0;
+  let revertedFixCount = 0;
 
-  // LOCKSTEP COLLABORATION: All 20 cursors converge onto one file together, patch & verify, then move together to the next file.
+  // Strictly per-file sequential: all agents converge on the same active file, animate in-file work, then move together.
   for (let fIdx = 0; fIdx < fileQueues.length; fIdx++) {
     const job = fileQueues[fIdx];
     let currentContent = initialFiles.fileContents[job.filePath];
     if (currentContent === undefined) continue;
 
-    const priorityLines = job.items.map((d) => d.line);
-    const assignedLines = getDistinctLinesForFile(currentContent, priorityLines, numAgents);
+    const assignedLines = getDistinctLinesForFile(
+      currentContent,
+      job.items.map((d) => d.line),
+      numAgents
+    );
 
     for (let i = 0; i < agents.length; i++) {
       const a = agents[i];
       a.status = 'navigating';
       a.filePath = job.filePath;
-      a.line = assignedLines[i];
-      a.column = 1;
-      a.diagnosticId = job.items[i]?.id ?? null;
-      a.task = `Converged on ${job.filePath}:${assignedLines[i]}`;
-      emit({
-        type: 'agent:update',
-        agent: { ...a },
-        logLine:
-          i === 0
-            ? `[Swarm ${fIdx + 1}/${fileQueues.length}] All ${numAgents} cursors converged on ${job.filePath}`
-            : undefined,
-      });
+      a.diagnosticId = null;
+      a.task = `Converged on ${job.filePath}`;
     }
-    await sleep(Math.round(580 * mult));
+    const convergeFrom = agents.map((a) => a.line || 1);
+    for (let step = 1; step <= 3; step++) {
+      for (let i = 0; i < agents.length; i++) {
+        const from = convergeFrom[i];
+        const to = assignedLines[i];
+        agents[i].line = Math.max(1, Math.round(from + ((to - from) * step) / 3));
+        agents[i].column = 1 + ((step + i * 3) % 24);
+        agents[i].status = step < 3 ? 'navigating' : 'scanning';
+      }
+      broadcast(`[Swarm ${fIdx + 1}/${fileQueues.length}] All ${numAgents} cursors converged on ${job.filePath}`);
+      await sleep(Math.round(120 * mult));
+    }
 
     const snapshotBeforeFile = currentContent;
     const baselineTscErrors = tsFiles.includes(job.filePath)
       ? await countFileTscErrors(workspaceDir, tsFiles, job.filePath)
       : 0;
-    const patchedIdsInFile: string[] = [];
-    let nextDiagIdx = 0;
-    let fileWriteChain = Promise.resolve();
+    const baselineTest = isTestFilePath(job.filePath)
+      ? await runTargetedTestCheck(workspaceDir, job.filePath)
+      : { ran: false, failed: 0, exitCode: 0 };
+    const patchedIdsInFile: Array<{ id: string; agentId: string }> = [];
 
-    const runWorkerOnFile = async (agent: CursorAgentState, workerIndex: number) => {
-      while (true) {
-        const dIdx = nextDiagIdx++;
-        if (dIdx >= job.items.length) break;
-        const diag = job.items[dIdx];
+    for (let dIdx = 0; dIdx < job.items.length; dIdx++) {
+      const diag = job.items[dIdx];
+      const writerIndex = dIdx % numAgents;
+      const writer = agents[writerIndex];
 
-        agent.status = 'navigating';
-        agent.filePath = job.filePath;
-        agent.line = diag.line;
-        agent.column = diag.column;
-        agent.diagnosticId = diag.id;
-        agent.task = `Fixing ${diag.code} at line ${diag.line}`;
-        emit({
-          type: 'agent:update',
-          agent: { ...agent },
-          logLine: `[${agent.name}] → ${job.filePath}:${diag.line} [${diag.code}] ${diag.title}`,
-        });
-
-        await sleep(Math.round(480 * mult));
-
-        const latestLines = currentContent.split(/\r?\n/);
-        const originalTargetLine = latestLines[diag.line - 1] ?? '';
-        let resolvedAfterLine = '';
-
-        if (diag.source === 'bug') {
-          const freshBug = analyzeBugsInCode(originalTargetLine, job.filePath).find(
-            (b) => b.code === diag.code
-          );
-          if (freshBug?.suggestedLinePatch) {
-            resolvedAfterLine = sanitizeCommonUnknownSymbols(freshBug.suggestedLinePatch);
-          }
-        } else if (diag.source === 'security') {
-          const freshSec = scanSourceCode(originalTargetLine, job.filePath).find(
-            (s) => `${s.ruleId} (${s.cwe})` === diag.code
-          );
-          if (freshSec?.patchedLine) {
-            resolvedAfterLine = sanitizeCommonUnknownSymbols(freshSec.patchedLine);
-          }
+      const writerFromLine = writer.line || 1;
+      for (let step = 1; step <= 2; step++) {
+        for (let i = 0; i < agents.length; i++) {
+          const a = agents[i];
+          a.filePath = job.filePath;
+          a.diagnosticId = diag.id;
+          a.line =
+            i === writerIndex
+              ? Math.max(1, Math.round(writerFromLine + ((diag.line - writerFromLine) * step) / 2))
+              : assignedLines[i];
+          a.column = 1 + ((step + i * 5) % 18);
+          a.status = i === writerIndex ? 'navigating' : 'scanning';
+          a.task =
+            i === writerIndex
+              ? `Navigating to ${job.filePath}:${diag.line} [${diag.code}]`
+              : `Scanning ${job.filePath} while ${writer.name} targets ${diag.code}`;
         }
+        broadcast(`[${writer.name}] → ${job.filePath}:${diag.line} [${diag.code}] ${diag.title}`);
+        await sleep(Math.round(140 * mult));
+      }
+      for (let i = 0; i < agents.length; i++) {
+        const a = agents[i];
+        a.line = i === writerIndex ? diag.line : assignedLines[i];
+        a.column = 1;
+        a.status = i === writerIndex ? 'navigating' : 'scanning';
+        a.task =
+          i === writerIndex
+            ? `Fixing ${diag.code} at ${job.filePath}:${diag.line}`
+            : `Scanning ${job.filePath} while ${writer.name} fixes ${diag.code}`;
+      }
+      broadcast(`[${writer.name}] → ${job.filePath}:${diag.line} [${diag.code}] ${diag.title}`);
 
-        if (!resolvedAfterLine && (diag.suggestedLinePatch || diag.suggestedFilePatch)) {
-          const candidate = applyDiagnosticFixToContent(currentContent, diag);
-          if (candidate !== currentContent) {
-            const candidateLines = candidate.split(/\r?\n/);
-            const rawPatchedLine = candidateLines[diag.line - 1] ?? '';
-            resolvedAfterLine = sanitizeCommonUnknownSymbols(rawPatchedLine);
-          }
+      const latestLines = currentContent.split(/\r?\n/);
+      const originalTargetLine = latestLines[diag.line - 1] ?? '';
+      let resolvedAfterLine = '';
+
+      if (diag.source === 'bug') {
+        const freshBug = analyzeBugsInCode(originalTargetLine, job.filePath).find((b) => b.code === diag.code);
+        if (freshBug?.suggestedLinePatch) resolvedAfterLine = sanitizeCommonUnknownSymbols(freshBug.suggestedLinePatch);
+      } else if (diag.source === 'security') {
+        const freshSec = scanSourceCode(originalTargetLine, job.filePath).find(
+          (s) => `${s.ruleId} (${s.cwe})` === diag.code
+        );
+        if (freshSec?.patchedLine) resolvedAfterLine = sanitizeCommonUnknownSymbols(freshSec.patchedLine);
+      }
+
+      if (!resolvedAfterLine && (diag.suggestedLinePatch || diag.suggestedFilePatch)) {
+        const candidate = applyDiagnosticFixToContent(currentContent, diag);
+        if (candidate !== currentContent) {
+          const rawPatchedLine = candidate.split(/\r?\n/)[diag.line - 1] ?? '';
+          resolvedAfterLine = sanitizeCommonUnknownSymbols(rawPatchedLine);
         }
+      }
+      if (!resolvedAfterLine && diag.source === 'typescript') {
+        const tsFix = applyDeterministicTypeScriptFix(originalTargetLine, diag);
+        if (tsFix && tsFix !== originalTargetLine) resolvedAfterLine = tsFix;
+      }
+      if (!resolvedAfterLine && ai) {
+        const aiLine = await synthesizeFixViaGemini(ai, job.filePath, currentContent, diag);
+        if (aiLine && aiLine !== originalTargetLine) resolvedAfterLine = aiLine;
+      }
 
-        if (!resolvedAfterLine && diag.source === 'typescript') {
-          const tsFix = applyDeterministicTypeScriptFix(originalTargetLine, diag);
-          if (tsFix && tsFix !== originalTargetLine) {
-            resolvedAfterLine = tsFix;
-          }
-        }
+      if (resolvedAfterLine && resolvedAfterLine !== originalTargetLine) {
+        writer.status = 'writing';
+        writer.line = diag.line;
+        writer.task = `Writing fix to ${job.filePath}:${diag.line}`;
+        writer.lastEditSnippet = resolvedAfterLine.trim();
 
-        if (!resolvedAfterLine && ai) {
-          const aiLine = await synthesizeFixViaGemini(ai, job.filePath, currentContent, diag);
-          if (aiLine && aiLine !== originalTargetLine) {
-            resolvedAfterLine = aiLine;
-          }
-        }
-
-        if (resolvedAfterLine && resolvedAfterLine !== originalTargetLine) {
-          agent.status = 'writing';
-          agent.task = `Writing fix to ${job.filePath}:${diag.line}`;
-          agent.lastEditSnippet = resolvedAfterLine.trim();
-
-          for (const ratio of [0.35, 0.72]) {
-            const partialLen = Math.max(1, Math.floor(resolvedAfterLine.length * ratio));
-            agent.column = partialLen + 1;
-            emit({ type: 'agent:update', agent: { ...agent } });
-            await sleep(Math.round(240 * mult));
-          }
-
-          fileWriteChain = fileWriteChain.then(async () => {
-            const liveLines = currentContent.split(/\r?\n/);
-            const beforeLine = liveLines[diag.line - 1] ?? '';
-            if (beforeLine === resolvedAfterLine) return;
-            liveLines[diag.line - 1] = resolvedAfterLine;
-            const nextContent = liveLines.join('\n');
-
-            await writeWorkspaceFile(workspaceDir, job.filePath, nextContent);
-            currentContent = nextContent;
-            patchedIdsInFile.push(diag.id);
-            fixedByAgent.set(diag.id, { agentId: agent.id });
-            agent.fixedCount += 1;
-            totalFixed += 1;
-            agent.status = 'editing';
-            agent.column = Math.max(1, resolvedAfterLine.length + 1);
-
-            const [gitDiff, fileStatuses] = await Promise.all([
-              computeWorkspaceGitDiff(workspaceDir),
-              getWorkspaceFileStatuses(workspaceDir),
-            ]);
-            emit({ type: 'agent:update', agent: { ...agent } });
+        const liveLines = currentContent.split(/\r?\n/);
+        const beforeLine = liveLines[diag.line - 1] ?? '';
+        if (beforeLine !== resolvedAfterLine) {
+          const frames = Math.max(8, Math.min(20, Math.ceil(resolvedAfterLine.length / 4) + 6));
+          for (let step = 1; step <= frames; step++) {
+            const charCount = Math.max(1, Math.floor((resolvedAfterLine.length * step) / frames));
+            const partialLine = resolvedAfterLine.slice(0, charCount);
+            writer.status = 'writing';
+            writer.line = diag.line;
+            writer.column = charCount + 1;
+            for (const a of agents) {
+              if (a !== writer) {
+                a.status = 'scanning';
+                a.filePath = job.filePath;
+                a.line = assignedLines[agents.indexOf(a)];
+                a.column = 1 + ((step * 3 + agents.indexOf(a) * 5) % 28);
+              }
+            }
+            const partialLines = [...liveLines];
+            partialLines[diag.line - 1] = partialLine;
+            const partialContent = partialLines.join('\n');
+            broadcast();
             emit({
-              type: 'file:patched',
-              agentId: agent.id,
-              agentName: agent.name,
-              agentColor: agent.color,
+              type: 'file:streaming',
+              agentId: writer.id,
+              agentName: writer.name,
+              agentColor: writer.color,
               filePath: job.filePath,
               line: diag.line,
-              beforeLine,
-              afterLine: resolvedAfterLine,
-              content: nextContent,
-              gitDiff,
-              fileStatuses,
-              diagnosticIds: [diag.id],
+              column: writer.column,
+              content: partialContent,
+              action: 'modify',
             });
+            await sleep(Math.round((35 + Math.min(40, resolvedAfterLine.length)) * mult));
+          }
+
+          liveLines[diag.line - 1] = resolvedAfterLine;
+          const nextContent = liveLines.join('\n');
+          await writeWorkspaceFile(workspaceDir, job.filePath, nextContent);
+          currentContent = nextContent;
+          patchedIdsInFile.push({ id: diag.id, agentId: writer.id });
+          writer.fixedCount += 1;
+          writer.status = 'editing';
+          writer.column = Math.max(1, resolvedAfterLine.length + 1);
+          writer.line = diag.line;
+
+          const [gitDiff, fileStatuses] = await Promise.all([
+            computeWorkspaceGitDiff(workspaceDir),
+            getWorkspaceFileStatuses(workspaceDir),
+          ]);
+          for (const a of agents) if (a !== writer) { a.status = 'scanning'; a.task = `Scanning ${job.filePath} after patch`; }
+          broadcast();
+          emit({
+            type: 'file:patched',
+            agentId: writer.id,
+            agentName: writer.name,
+            agentColor: writer.color,
+            filePath: job.filePath,
+            line: diag.line,
+            beforeLine,
+            afterLine: resolvedAfterLine,
+            content: nextContent,
+            gitDiff,
+            fileStatuses,
+            diagnosticIds: [diag.id],
           });
-          await fileWriteChain;
-          await sleep(Math.round(300 * mult));
+          await sleep(Math.round(220 * mult));
         }
       }
 
-      if (workerIndex >= job.items.length) {
-        agent.status = 'verifying';
-        agent.filePath = job.filePath;
-        agent.line = assignedLines[workerIndex];
-        agent.column = Math.max(1, Math.min(28, (workerIndex * 3) % 24));
-        agent.task = `Guarding ${job.filePath}:${assignedLines[workerIndex]}`;
-        emit({ type: 'agent:update', agent: { ...agent } });
-        await sleep(Math.round(380 * mult));
+      for (let step = 1; step <= 3; step++) {
+        for (let i = 0; i < agents.length; i++) {
+          const a = agents[i];
+          a.status = 'verifying';
+          a.filePath = job.filePath;
+          a.diagnosticId = diag.id;
+          a.line = i === writerIndex ? diag.line : assignedLines[i];
+          a.column = 1 + ((step * 7 + i * 4 + dIdx) % 32);
+          a.task = `Verifying ${job.filePath}:${a.line}`;
+        }
+        broadcast();
+        await sleep(Math.round(70 * mult));
       }
-    };
+    }
 
-    await Promise.all(agents.map((a, idx) => runWorkerOnFile(a, idx)));
-
-    if (patchedIdsInFile.length > 0 && tsFiles.includes(job.filePath)) {
-      for (const a of agents) {
-        a.status = 'verifying';
-        a.task = `Verifying tsc on ${job.filePath}…`;
-        emit({ type: 'agent:update', agent: { ...a } });
+    if (patchedIdsInFile.length > 0) {
+      for (let step = 1; step <= 3; step++) {
+        for (let i = 0; i < agents.length; i++) {
+          const a = agents[i];
+          a.status = 'verifying';
+          a.filePath = job.filePath;
+          a.diagnosticId = null;
+          a.line = assignedLines[i];
+          a.column = 1 + ((step * 9 + i * 5) % 36);
+          a.task = `Verifying checks on ${job.filePath}…`;
+        }
+        broadcast(`[Swarm] Verifying ${job.filePath} with real checks…`);
+        await sleep(Math.round(80 * mult));
       }
-      const afterTscErrors = await countFileTscErrors(workspaceDir, tsFiles, job.filePath);
-      if (afterTscErrors > baselineTscErrors) {
+      let revertReason = '';
+      if (tsFiles.includes(job.filePath)) {
+        const afterTscErrors = await countFileTscErrors(workspaceDir, tsFiles, job.filePath);
+        if (afterTscErrors > baselineTscErrors) {
+          revertReason = `tsc errors increased ${baselineTscErrors} → ${afterTscErrors}`;
+        }
+      }
+      if (!revertReason && isTestFilePath(job.filePath)) {
+        const afterTest = await runTargetedTestCheck(workspaceDir, job.filePath);
+        if (afterTest.ran && (afterTest.failed > baselineTest.failed || (!baselineTest.ran && afterTest.exitCode !== 0))) {
+          revertReason = `test checks regressed (${baselineTest.failed} → ${afterTest.failed} failures)`;
+        }
+      }
+      if (revertReason) {
         await writeWorkspaceFile(workspaceDir, job.filePath, snapshotBeforeFile);
         const revertedDiff = await computeWorkspaceGitDiff(workspaceDir);
-        for (const pid of patchedIdsInFile) {
-          fixedByAgent.delete(pid);
+        for (const p of patchedIdsInFile) {
+          const ag = agents.find((a) => a.id === p.agentId);
+          if (ag) ag.fixedCount = Math.max(0, ag.fixedCount - 1);
         }
-        totalFixed = Math.max(0, totalFixed - patchedIdsInFile.length);
+        revertedFixCount += patchedIdsInFile.length;
+        broadcast(`[Swarm] Reverted ${job.filePath}: ${revertReason}`);
         emit({
           type: 'file:reverted',
           agentId: agents[0].id,
           filePath: job.filePath,
-          reason: `Reverted unsafe edit in ${job.filePath} (tsc errors increased ${baselineTscErrors} → ${afterTscErrors}).`,
+          reason: `Reverted unsafe edit in ${job.filePath} (${revertReason}).`,
           content: snapshotBeforeFile,
           gitDiff: revertedDiff,
         });
+      } else {
+        verifiedFixCount += patchedIdsInFile.length;
+        broadcast(`[Swarm] Verified ${job.filePath}: ${patchedIdsInFile.length} patch(es) passed file checks.`);
       }
     }
   }
+
+  for (const a of agents) {
+    a.status = 'verifying';
+    a.diagnosticId = null;
+    a.task = 'Final workspace re-scan (tsc/tests/checks)…';
+  }
+  broadcast('[Swarm] Per-file fixing complete. Running final verification/re-scan…');
+
+  emit({
+    type: 'phase',
+    phase: 'verifying',
+    message: 'Running final tsc --noEmit + test suite re-scan for truthful results…',
+  });
+
+  let hbTick = 0;
+  const finalHb = setInterval(() => {
+    hbTick++;
+    for (let i = 0; i < agents.length; i++) {
+      const a = agents[i];
+      a.status = 'verifying';
+      a.diagnosticId = null;
+      a.column = 1 + ((hbTick * 7 + i * 11) % 40);
+      a.task = 'Final workspace re-scan (tsc/tests/checks)…';
+    }
+    broadcast();
+  }, 180);
+
+  let finalFiles, finalDebug, finalDiff, finalStatuses;
+  try {
+    finalFiles = await readAllTextFiles(workspaceDir);
+    finalDebug = await runParallelDebugSwarm(workspaceDir, finalFiles.fileContents, false);
+    [finalDiff, finalStatuses] = await Promise.all([
+      computeWorkspaceGitDiff(workspaceDir),
+      getWorkspaceFileStatuses(workspaceDir),
+    ]);
+  } finally {
+    clearInterval(finalHb);
+  }
+
+  const remainingErrors = finalDebug.diagnostics.filter((d) => d.severity === 'error').length;
+  const evidence = `verified=${verifiedFixCount} reverted=${revertedFixCount} open=${finalDebug.diagnostics.length} openErrors=${remainingErrors} tscErrors=${finalDebug.tscResult.errorCount} testsFailed=${finalDebug.testResult.failed}`;
 
   for (const a of agents) {
     a.status = 'done';
     a.diagnosticId = null;
     a.task =
       a.fixedCount > 0
-        ? `Patched & verified ${a.fixedCount} issue${a.fixedCount === 1 ? '' : 's'}`
+        ? `Applied ${a.fixedCount} verified patch${a.fixedCount === 1 ? '' : 'es'}`
         : 'Verified target files';
-    emit({
-      type: 'agent:update',
-      agent: { ...a },
-      logLine:
-        a.fixedCount > 0
-          ? `[${a.name}] Done (${a.fixedCount} fixes written & verified).`
-          : undefined,
-    });
   }
-
-  emit({
-    type: 'phase',
-    phase: 'verifying',
-    message: 'Running final tsc --noEmit + test suite verification across patched workspace…',
-  });
-
-  const finalFiles = await readAllTextFiles(workspaceDir);
-  const finalDebug = await runParallelDebugSwarm(workspaceDir, finalFiles.fileContents, false);
-  const [finalDiff, finalStatuses] = await Promise.all([
-    computeWorkspaceGitDiff(workspaceDir),
-    getWorkspaceFileStatuses(workspaceDir),
-  ]);
-
-  const mergedDiagnostics: CodeDiagnostic[] = [];
-  for (const prev of initialDebug.diagnostics) {
-    if (fixedByAgent.has(prev.id)) {
-      const info = fixedByAgent.get(prev.id)!;
-      mergedDiagnostics.push({
-        ...prev,
-        fixed: true,
-        fixedByAgentId: info.agentId,
-        verified: true,
-      });
-    }
-  }
-  for (const rem of finalDebug.diagnostics) {
-    mergedDiagnostics.push(rem);
-  }
-
-  const remainingErrors = mergedDiagnostics.filter(
-    (d) => !d.fixed && d.severity === 'error'
-  ).length;
+  broadcast();
 
   emit({
     type: 'phase',
     phase: 'complete',
-    message: `Swarm completed ${totalFixed} verified fixes (${remainingErrors} open errors remaining, tests passed: ${finalDebug.testResult.passed}).`,
+    message: `Swarm finished with post-fix verification evidence: ${evidence}.`,
   });
 
   emit({
@@ -613,12 +696,12 @@ export async function runAutonomousSwarmFix(params: {
     result: {
       workspaceId,
       subagents: finalDebug.subagents,
-      diagnostics: mergedDiagnostics,
+      diagnostics: finalDebug.diagnostics,
       tscResult: finalDebug.tscResult,
       testResult: finalDebug.testResult,
       terminalLines: [
         ...finalDebug.terminalLines,
-        `[Swarm-Fix] Fixed ${totalFixed} issues across ${fileQueues.length} files with ${numAgents} cursors.`,
+        `[Swarm-Fix] Evidence: ${evidence}. Files queued: ${fileQueues.length}. Cursors: ${numAgents} (strictly one file at a time).`,
       ],
       gitDiff: finalDiff,
       fileStatuses: finalStatuses,
@@ -628,7 +711,7 @@ export async function runAutonomousSwarmFix(params: {
     fileContents: finalFiles.fileContents,
     files: finalFiles.files,
     fileStatuses: finalStatuses,
-    fixedCount: totalFixed,
-    summary: `Fixed ${totalFixed} issues across ${fileQueues.length} files.`,
+    fixedCount: verifiedFixCount,
+    summary: `Verified ${verifiedFixCount} patch(es), reverted ${revertedFixCount}, ${finalDebug.diagnostics.length} diagnostic(s) remain (truthful post-fix re-scan).`,
   });
 }
