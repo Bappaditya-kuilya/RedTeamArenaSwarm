@@ -1,0 +1,6 @@
+{
+  "name": "RedTeam Swarm Arena",
+  "description": "Live adversarial Red Team vs Blue Team agent cursor swarm arena that probes, exploits, patches, and verifies web applications in real time.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

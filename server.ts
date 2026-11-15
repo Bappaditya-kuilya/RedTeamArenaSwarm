@@ -1,0 +1,377 @@
+import 'dotenv/config';
+import express from 'express';
+import { createServer as createHttpServer } from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  computeWorkspaceGitDiff,
+  getWorkspaceFileStatuses,
+  getWorkspaceMeta,
+  importBuggyDemoWorkspace,
+  importCustomFilesWorkspace,
+  importGitHubWorkspace,
+  importLocalWorkspace,
+  readAllTextFiles,
+  revertWorkspaceChanges,
+  runSafeWorkspaceCommand,
+  writeWorkspaceFile,
+} from './server/repoManager';
+import { runParallelDebugSwarm } from './server/subagentRunner';
+import { runAutonomousFeatureBuild } from './server/swarmComposer';
+import { runAutonomousSwarmFix } from './server/swarmFixer';
+import {
+  applyAllFixesToFiles,
+  applyDiagnosticFixToContent,
+} from './src/engine/bugAnalyzer';
+import type { CodeDiagnostic, CursorSpeed } from './src/types/ide';
+
+function parseSpeed(val: unknown): CursorSpeed {
+  return val === 'normal' || val === 'fast' ? val : 'slow';
+}
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = 3000;
+
+app.use(express.json({ limit: '2mb' }));
+
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true });
+});
+
+app.post('/api/repo/import', async (req, res) => {
+  try {
+    const { source, repoUrl, name, files } = req.body as {
+      source?: 'github' | 'workspace' | 'custom' | 'demo';
+      repoUrl?: string;
+      name?: string;
+      files?: Array<{ path: string; content: string }>;
+    };
+
+    if (source === 'workspace') {
+      const snapshot = await importLocalWorkspace(__dirname);
+      return res.json(snapshot);
+    }
+
+    if (source === 'demo') {
+      const snapshot = await importBuggyDemoWorkspace();
+      return res.json(snapshot);
+    }
+
+    if (source === 'custom' && Array.isArray(files) && files.length > 0) {
+      const snapshot = await importCustomFilesWorkspace(name || 'custom/project', files);
+      return res.json(snapshot);
+    }
+
+    if (!repoUrl || typeof repoUrl !== 'string') {
+      return res.status(400).json({ error: 'Provide a GitHub URL or owner/repo slug.' });
+    }
+
+    const snapshot = await importGitHubWorkspace(repoUrl);
+    return res.json(snapshot);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to import repository.';
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.post('/api/repo/:workspaceId/debug', async (req, res) => {
+  try {
+    const meta = getWorkspaceMeta(req.params.workspaceId);
+    if (!meta) {
+      return res.status(404).json({ error: 'Workspace session expired or not found. Re-import the repository.' });
+    }
+    const { useAi = true } = (req.body || {}) as { useAi?: boolean };
+    const { fileContents } = await readAllTextFiles(meta.dir);
+    const result = await runParallelDebugSwarm(meta.dir, fileContents, useAi);
+    const [gitDiff, fileStatuses] = await Promise.all([
+      computeWorkspaceGitDiff(meta.dir),
+      getWorkspaceFileStatuses(meta.dir),
+    ]);
+    return res.json({
+      workspaceId: meta.workspaceId,
+      ...result,
+      gitDiff,
+      fileStatuses,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Subagent debug run failed.';
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/repo/:workspaceId/swarm-fix', async (req, res) => {
+  const meta = getWorkspaceMeta(req.params.workspaceId);
+  if (!meta) {
+    return res.status(404).json({ error: 'Workspace session expired or not found.' });
+  }
+
+  const { agentCount = 20, useAi = true, speed } = (req.body || {}) as {
+    agentCount?: number;
+    useAi?: boolean;
+    speed?: CursorSpeed;
+  };
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  let closed = false;
+  res.on('close', () => {
+    closed = true;
+  });
+
+  try {
+    await runAutonomousSwarmFix({
+      workspaceId: meta.workspaceId,
+      workspaceDir: meta.dir,
+      agentCount,
+      speed: parseSpeed(speed),
+      useAi,
+      emit: (event) => {
+        if (!closed) {
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+      },
+    });
+  } catch (err) {
+    if (!closed) {
+      const message = err instanceof Error ? err.message : 'Autonomous swarm fix failed.';
+      res.write(`data: ${JSON.stringify({ type: 'error', message })}\n\n`);
+    }
+  } finally {
+    if (!closed) {
+      res.end();
+    }
+  }
+});
+
+app.post('/api/repo/:workspaceId/composer', async (req, res) => {
+  const meta = getWorkspaceMeta(req.params.workspaceId);
+  if (!meta) {
+    return res.status(404).json({ error: 'Workspace session expired or not found.' });
+  }
+
+  const { prompt, agentCount = 20, useAi = true, speed } = (req.body || {}) as {
+    prompt?: string;
+    agentCount?: number;
+    useAi?: boolean;
+    speed?: CursorSpeed;
+  };
+
+  if (!prompt || typeof prompt !== 'string' || prompt.trim().length < 3) {
+    return res.status(400).json({ error: 'Enter a feature or code instruction for the Cursor swarm.' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  let closed = false;
+  res.on('close', () => {
+    closed = true;
+  });
+
+  try {
+    await runAutonomousFeatureBuild({
+      workspaceId: meta.workspaceId,
+      workspaceDir: meta.dir,
+      prompt: prompt.trim(),
+      agentCount,
+      speed: parseSpeed(speed),
+      useAi,
+      emit: (event) => {
+        if (!closed) {
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+      },
+    });
+  } catch (err) {
+    if (!closed) {
+      const message = err instanceof Error ? err.message : 'Swarm feature build failed.';
+      res.write(`data: ${JSON.stringify({ type: 'error', message })}\n\n`);
+    }
+  } finally {
+    if (!closed) {
+      res.end();
+    }
+  }
+});
+
+app.post('/api/repo/:workspaceId/create-file', async (req, res) => {
+  try {
+    const meta = getWorkspaceMeta(req.params.workspaceId);
+    if (!meta) {
+      return res.status(404).json({ error: 'Workspace session not found.' });
+    }
+    const { filePath, content = '' } = req.body as { filePath?: string; content?: string };
+    if (!filePath || typeof filePath !== 'string' || !filePath.trim()) {
+      return res.status(400).json({ error: 'Provide a valid relative file path.' });
+    }
+    const cleanPath = filePath.trim().replace(/^\/+/, '');
+    await writeWorkspaceFile(meta.dir, cleanPath, content);
+    const [{ files, fileContents }, gitDiff, fileStatuses] = await Promise.all([
+      readAllTextFiles(meta.dir),
+      computeWorkspaceGitDiff(meta.dir),
+      getWorkspaceFileStatuses(meta.dir),
+    ]);
+    return res.json({
+      workspaceId: meta.workspaceId,
+      filePath: cleanPath,
+      files,
+      fileContents,
+      gitDiff,
+      fileStatuses,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to create file.';
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.post('/api/repo/:workspaceId/run-command', async (req, res) => {
+  try {
+    const meta = getWorkspaceMeta(req.params.workspaceId);
+    if (!meta) {
+      return res.status(404).json({ error: 'Workspace session not found.' });
+    }
+    const { command } = req.body as { command?: string };
+    if (!command || typeof command !== 'string') {
+      return res.status(400).json({ error: 'Provide a terminal command.' });
+    }
+    const result = await runSafeWorkspaceCommand(meta.dir, command);
+    return res.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Command execution failed.';
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/repo/:workspaceId/apply-fix', async (req, res) => {
+  try {
+    const meta = getWorkspaceMeta(req.params.workspaceId);
+    if (!meta) {
+      return res.status(404).json({ error: 'Workspace session not found.' });
+    }
+
+    const {
+      diagnostics = [],
+      diagnosticId,
+      applyAll = false,
+      manualEdit,
+    } = req.body as {
+      diagnostics?: CodeDiagnostic[];
+      diagnosticId?: string;
+      applyAll?: boolean;
+      manualEdit?: { filePath: string; content: string };
+    };
+
+    const { fileContents } = await readAllTextFiles(meta.dir);
+    let appliedIds = new Set<string>();
+    const updatedFiles: Record<string, string> = {};
+
+    if (manualEdit && typeof manualEdit.filePath === 'string') {
+      await writeWorkspaceFile(meta.dir, manualEdit.filePath, manualEdit.content);
+      updatedFiles[manualEdit.filePath] = manualEdit.content;
+    } else if (applyAll) {
+      const resAll = applyAllFixesToFiles(fileContents, diagnostics);
+      appliedIds = resAll.appliedIds;
+      for (const [fp, nextContent] of Object.entries(resAll.updatedFiles)) {
+        if (nextContent !== fileContents[fp]) {
+          await writeWorkspaceFile(meta.dir, fp, nextContent);
+          updatedFiles[fp] = nextContent;
+        }
+      }
+    } else if (diagnosticId) {
+      const targetDiag = diagnostics.find((d) => d.id === diagnosticId);
+      if (targetDiag && fileContents[targetDiag.filePath] !== undefined) {
+        const nextContent = applyDiagnosticFixToContent(
+          fileContents[targetDiag.filePath],
+          targetDiag
+        );
+        if (nextContent !== fileContents[targetDiag.filePath]) {
+          await writeWorkspaceFile(meta.dir, targetDiag.filePath, nextContent);
+          updatedFiles[targetDiag.filePath] = nextContent;
+          appliedIds.add(targetDiag.id);
+        }
+      }
+    }
+
+    const [gitDiff, fileStatuses] = await Promise.all([
+      computeWorkspaceGitDiff(meta.dir),
+      getWorkspaceFileStatuses(meta.dir),
+    ]);
+    const nextDiagnostics = diagnostics.map((d) =>
+      appliedIds.has(d.id) ? { ...d, fixed: true } : d
+    );
+
+    return res.json({
+      workspaceId: meta.workspaceId,
+      appliedCount: appliedIds.size || (manualEdit ? 1 : 0),
+      updatedFiles,
+      gitDiff,
+      fileStatuses,
+      diagnostics: nextDiagnostics,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to apply fix to workspace.';
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post('/api/repo/:workspaceId/reset', async (req, res) => {
+  try {
+    const meta = getWorkspaceMeta(req.params.workspaceId);
+    if (!meta) {
+      return res.status(404).json({ error: 'Workspace session not found.' });
+    }
+    await revertWorkspaceChanges(meta.dir);
+    const { files, fileContents } = await readAllTextFiles(meta.dir);
+    return res.json({
+      workspaceId: meta.workspaceId,
+      files,
+      fileContents,
+      gitDiff: '',
+      fileStatuses: {},
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to reset workspace.';
+    return res.status(500).json({ error: message });
+  }
+});
+
+async function startServer() {
+  const isProd = process.env.NODE_ENV === 'production';
+  const httpServer = createHttpServer(app);
+
+  if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: hmrDisabled ? false : undefined,
+        ws: { server: httpServer },
+        allowedHosts: true,
+      },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distDir = path.resolve(__dirname, 'dist');
+    app.use(express.static(distDir));
+    app.get('/{*splat}', (_req, res) => {
+      res.sendFile(path.join(distDir, 'index.html'));
+    });
+  }
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`Swarm Code IDE running at http://localhost:${PORT}`);
+  });
+}
+
+startServer();

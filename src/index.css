@@ -1,0 +1,97 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --paper: #F8F9FA;
+    --surface: #FFFFFF;
+    --ink: #121417;
+    --ink-secondary: #30343A;
+    --muted: #6B7078;
+    --border: #E0E2E5;
+    --accent: #0D99FF;
+    --guide: #F24822;
+    --success: #14AE5C;
+    --font-display: "Inter", system-ui, -apple-system, sans-serif;
+    --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+    background-color: var(--paper);
+    color: var(--ink);
+  }
+
+  body {
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1,
+  h2,
+  .font-display {
+    font-family: var(--font-display);
+    font-feature-settings: "cv11", "ss01";
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background: #0d99ff47;
+  }
+
+  ::-webkit-scrollbar {
+    width: 7px;
+    height: 7px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(107, 112, 120, 0.25);
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(13, 153, 255, 0.5);
+  }
+}
+
+@keyframes swarmCaretBlink {
+  0%, 49% {
+    opacity: 1;
+  }
+  50%, 100% {
+    opacity: 0.2;
+  }
+}
+
+.swarm-caret {
+  display: inline-block;
+  width: 1.5px;
+  height: 17px;
+  vertical-align: text-bottom;
+  animation: swarmCaretBlink 0.9s steps(1) infinite;
+}
+
+.swarm-pointer-svg {
+  filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.28));
+}
+
+.swarm-cursor-label {
+  border-radius: 4px;
+  font: 600 11px/15px Inter, system-ui, sans-serif;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+  white-space: nowrap;
+}
