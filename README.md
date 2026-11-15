@@ -1,3 +1,13 @@
+---
+title: Swarm IDE
+emoji: 🐝
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Swarm IDE (RedTeamArenaSwarm)
 
 A VS Code–style, web-based multi-agent coding/debugging workbench. It imports real GitHub repositories (or local/custom files), scans for issues with real tools, and runs a 10-cursor swarm to help analyze and apply fixes in a single active file at a time.
