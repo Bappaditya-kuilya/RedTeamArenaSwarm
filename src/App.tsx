@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { IdeDebuggerView } from './components/IdeDebuggerView';
 import { SWARM_CURSOR_PROFILES } from './engine/swarmProfiles';
+import { applyAllFixesToFiles, applyDiagnosticFixToContent } from './engine/bugAnalyzer';
 import type {
   ApplyFixResponse,
   CodeDiagnostic,
@@ -220,39 +221,156 @@ function buildShowcaseDemoScanResult(ws: WorkspaceSnapshot): DebugRunResponse {
     agentName: 'Security/Bug Subagent',
     agentColor: '#f59e0b',
     fixed: false,
+    verified: false,
     verificationStatus: 'open',
     provenance: `demo:${d.source} ${d.filePath}:${d.line} [${d.code}]`,
     evidence: [d.explanation],
     ...d,
   });
-  const diagnostics: CodeDiagnostic[] = [
-    mkDiag({ id: 'demo-1', filePath: 'src/pricing.ts', line: 2, column: 27, code: 'TS2322', title: 'Type mismatch', message: "Type 'string' is not assignable to type 'number' (taxRate).", source: 'typescript', severity: 'error', agentId: 'subagent-tsc', agentName: 'TSC Subagent', agentColor: '#3b82f6', explanation: 'taxRate is typed as number but assigned a string literal.' }),
-    mkDiag({ id: 'demo-2', filePath: 'src/pricing.ts', line: 3, column: 15, code: 'parseint-radix', title: 'parseInt without radix', message: 'parseInt called without radix; may parse unexpectedly.', source: 'bug', severity: 'warning', agentId: 'subagent-bug', agentName: 'Bug Subagent', agentColor: '#8b5cf6', explanation: 'Use parseInt(rawQty, 10) for deterministic parsing.' }),
-    mkDiag({ id: 'demo-3', filePath: 'src/pricing.ts', line: 4, column: 11, code: 'eqeqeq', title: 'Loose equality', message: 'Use strict equality (===) instead of ==.', source: 'bug', severity: 'warning', agentId: 'subagent-bug', agentName: 'Bug Subagent', agentColor: '#8b5cf6', explanation: 'Loose equality can coerce types unexpectedly.' }),
-    mkDiag({ id: 'demo-4', filePath: 'src/users.ts', line: 6, column: 29, code: 'sql-injection', title: 'Possible SQL injection', message: 'User input concatenated directly into SQL query.', source: 'security', severity: 'error', agentId: 'subagent-sec', agentName: 'Security Subagent', agentColor: '#f59e0b', explanation: 'Use parameterized queries/placeholders instead of string concatenation.' }),
-    mkDiag({ id: 'demo-5', filePath: 'src/users.ts', line: 12, column: 7, code: 'unreachable-catch', title: 'Unreachable error handling', message: 'try/catch structure can hide parse failures / unreachable catch.', source: 'bug', severity: 'warning', agentId: 'subagent-bug', agentName: 'Bug Subagent', agentColor: '#8b5cf6', explanation: 'JSON.parse should be inside try/catch to handle invalid input safely.' }),
-    mkDiag({ id: 'demo-6', filePath: 'src/render.ts', line: 2, column: 3, code: 'no-debugger', title: 'Debugger statement', message: 'Unexpected debugger statement in source.', source: 'bug', severity: 'warning', agentId: 'subagent-bug', agentName: 'Bug Subagent', agentColor: '#8b5cf6', explanation: 'Remove debugger statements before shipping.' }),
-    mkDiag({ id: 'demo-7', filePath: 'src/render.ts', line: 3, column: 13, code: 'xss-innerHTML', title: 'Potential XSS sink', message: 'Assigning untrusted content to innerHTML can enable XSS.', source: 'security', severity: 'error', agentId: 'subagent-sec', agentName: 'Security Subagent', agentColor: '#f59e0b', explanation: 'Prefer textContent or sanitize/escape untrusted HTML.' }),
-  ];
+  const contents = ws.fileContents ?? {};
+  const present = (id: string, filePath: string, needle: string) => {
+    const c = contents[filePath] ?? '';
+    return c.includes(needle);
+  };
+
+  const diagnostics: CodeDiagnostic[] = [];
+  if (present('demo-1', 'src/pricing.ts', "const taxRate: number = '0.08';")) {
+    diagnostics.push(mkDiag({
+      id: 'demo-1', filePath: 'src/pricing.ts', line: 2, column: 27, code: 'TS2322',
+      title: 'Type mismatch', message: "Type 'string' is not assignable to type 'number' (taxRate).",
+      source: 'typescript', severity: 'error', agentId: 'subagent-tsc', agentName: 'TSC Subagent', agentColor: '#3b82f6',
+      explanation: 'taxRate is typed as number but assigned a string literal.',
+      originalLine: "  const taxRate: number = '0.08';",
+      suggestedLinePatch: '  const taxRate = 0.08;',
+    }));
+  }
+  if (present('demo-2', 'src/pricing.ts', 'const qty = parseInt(rawQty);')) {
+    diagnostics.push(mkDiag({
+      id: 'demo-2', filePath: 'src/pricing.ts', line: 3, column: 15, code: 'BUG-PARSEINT-RADIX',
+      title: 'parseInt without radix', message: 'parseInt called without radix; may parse unexpectedly.',
+      source: 'bug', severity: 'warning', agentId: 'subagent-bug', agentName: 'Bug Subagent', agentColor: '#8b5cf6',
+      explanation: 'Use parseInt(rawQty, 10) for deterministic parsing.',
+      originalLine: '  const qty = parseInt(rawQty);',
+      suggestedLinePatch: '  const qty = parseInt(rawQty, 10);',
+    }));
+  }
+  if (present('demo-3', 'src/pricing.ts', 'if (qty == 0) throw "Quantity must be positive";')) {
+    diagnostics.push(mkDiag({
+      id: 'demo-3', filePath: 'src/pricing.ts', line: 4, column: 11, code: 'BUG-LOOSE-EQ',
+      title: 'Loose equality / thrown string', message: 'Use strict equality and throw Error instances.',
+      source: 'bug', severity: 'warning', agentId: 'subagent-bug', agentName: 'Bug Subagent', agentColor: '#8b5cf6',
+      explanation: 'Loose equality can coerce types; throwing strings loses stack traces.',
+      originalLine: '  if (qty == 0) throw "Quantity must be positive";',
+      suggestedLinePatch: '  if (qty === 0) throw new Error("Quantity must be positive");',
+    }));
+  }
+  if (present('demo-4', 'src/users.ts', 'const rows = await db.query("SELECT id, email FROM users WHERE email = " + email);')) {
+    diagnostics.push(mkDiag({
+      id: 'demo-4', filePath: 'src/users.ts', line: 6, column: 29, code: 'sql-injection',
+      title: 'Possible SQL injection', message: 'User input concatenated directly into SQL query.',
+      source: 'security', severity: 'error', agentId: 'subagent-sec', agentName: 'Security Subagent', agentColor: '#f59e0b',
+      explanation: 'Use parameterized queries/placeholders instead of string concatenation.',
+      originalLine: '  const rows = await db.query("SELECT id, email FROM users WHERE email = " + email);',
+      suggestedLinePatch: '  const rows = await db.query("SELECT id, email FROM users WHERE email = ?", [email]);',
+    }));
+  }
+  const usersUnfixed = present('demo-5', 'src/users.ts', '  const parsed = JSON.parse(rawJson);') && present('demo-5', 'src/users.ts', '  try {');
+  if (usersUnfixed) {
+    diagnostics.push(mkDiag({
+      id: 'demo-5', filePath: 'src/users.ts', line: 11, column: 1, code: 'unreachable-catch',
+      title: 'Unsafe JSON parse structure', message: 'JSON.parse is outside try/catch; parse failures are not handled safely.',
+      source: 'bug', severity: 'warning', agentId: 'subagent-bug', agentName: 'Bug Subagent', agentColor: '#8b5cf6',
+      explanation: 'JSON.parse should be inside try/catch to handle invalid input safely.',
+      suggestedFilePatch: [
+        'export interface DbClient {',
+        '  query: (sql: string, params?: unknown[]) => Promise<unknown[]>;',
+        '}',
+        '',
+        'export async function findUserByEmail(db: DbClient, email: string) {',
+        '  const rows = await db.query("SELECT id, email FROM users WHERE email = ?", [email]);',
+        '  return rows[0] ?? null;',
+        '}',
+        '',
+        'export function parseUserMetadata(rawJson: string): Record<string, unknown> | null {',
+        '  try {',
+        '    const parsed = JSON.parse(rawJson);',
+        '    if (parsed == null) return null;',
+        '    return parsed as Record<string, unknown>;',
+        '  } catch {',
+        '    return null;',
+        '  }',
+        '}',
+        '',
+      ].join('\n'),
+    }));
+  }
+  if (present('demo-6', 'src/render.ts', '  debugger;')) {
+    diagnostics.push(mkDiag({
+      id: 'demo-6', filePath: 'src/render.ts', line: 2, column: 3, code: 'BUG-DEBUGGER-STMT',
+      title: 'Debugger statement', message: 'Unexpected debugger statement in source.',
+      source: 'bug', severity: 'warning', agentId: 'subagent-bug', agentName: 'Bug Subagent', agentColor: '#8b5cf6',
+      explanation: 'Remove debugger statements before shipping.',
+      originalLine: '  debugger;',
+      suggestedLinePatch: '  // removed leftover debugger breakpoint',
+    }));
+  }
+  if (present('demo-7', 'src/render.ts', '  container.innerHTML = bio;')) {
+    diagnostics.push(mkDiag({
+      id: 'demo-7', filePath: 'src/render.ts', line: 3, column: 13, code: 'xss-innerHTML',
+      title: 'Potential XSS sink', message: 'Assigning untrusted content to innerHTML can enable XSS.',
+      source: 'security', severity: 'error', agentId: 'subagent-sec', agentName: 'Security Subagent', agentColor: '#f59e0b',
+      explanation: 'Prefer textContent or sanitize/escape untrusted HTML.',
+      originalLine: '  container.innerHTML = bio;',
+      suggestedLinePatch: '  container.textContent = bio;',
+    }));
+  }
+
   return {
     workspaceId: ws.workspaceId,
     subagents: [
-      { id: 'subagent-tsc', name: 'TSC Subagent', specialty: 'TypeScript', color: '#3b82f6', status: 'done', elapsedMs: now, findingsCount: 1, summary: 'Found type errors in demo workspace (showcase).' },
-      { id: 'subagent-sec', name: 'Security Subagent', specialty: 'Security', color: '#f59e0b', status: 'done', elapsedMs: now, findingsCount: 2, summary: 'Detected risky SQL/DOM patterns (showcase).' },
-      { id: 'subagent-bug', name: 'Bug Subagent', specialty: 'Bug patterns', color: '#8b5cf6', status: 'done', elapsedMs: now, findingsCount: 4, summary: 'Detected correctness and hygiene issues (showcase).' },
+      { id: 'subagent-tsc', name: 'TSC Subagent', specialty: 'TypeScript', color: '#3b82f6', status: 'done', elapsedMs: now, findingsCount: diagnostics.filter(d => d.source === 'typescript').length, summary: diagnostics.length ? 'Analyzed demo workspace (showcase).' : 'No type issues detected in showcase demo.' },
+      { id: 'subagent-sec', name: 'Security Subagent', specialty: 'Security', color: '#f59e0b', status: 'done', elapsedMs: now, findingsCount: diagnostics.filter(d => d.source === 'security').length, summary: diagnostics.some(d=>d.source==='security') ? 'Detected risky SQL/DOM patterns (showcase).' : 'No security issues detected in showcase demo.' },
+      { id: 'subagent-bug', name: 'Bug Subagent', specialty: 'Bug patterns', color: '#8b5cf6', status: 'done', elapsedMs: now, findingsCount: diagnostics.filter(d => d.source === 'bug').length, summary: diagnostics.some(d=>d.source==='bug') ? 'Detected correctness and hygiene issues (showcase).' : 'No bug-pattern issues detected in showcase demo.' },
     ],
     diagnostics,
-    tscResult: { ran: false, filesChecked: 5, errorCount: 1, warningCount: 0, durationMs: now, output: 'Showcase mode: backend unavailable (static deploy). Displaying sample diagnostics for demo.' },
+    tscResult: { ran: false, filesChecked: 5, errorCount: diagnostics.filter(d => d.severity === 'error' && d.source === 'typescript').length, warningCount: 0, durationMs: now, output: 'Showcase mode: backend unavailable (static deploy). Displaying sample diagnostics for demo.' },
     testResult: { ran: false, command: 'node --test', exitCode: 0, durationMs: 0, passed: 0, failed: 0, skipped: 0, output: 'Showcase mode: tests not executed without backend.' },
     terminalLines: [
-      '[showcase] Running without backend API; loaded local demo workspace.',
+      '[showcase] Running without backend API; local demo workspace.',
       '[showcase] Real clone/tsc/tests/git/fix require a Node server deployment.',
     ],
-    gitDiff: '',
+    gitDiff: computeShowcaseGitDiff(buildClientDemoSnapshot().fileContents, contents),
     fileStatuses: ws.fileStatuses ?? {},
     totalElapsedMs: 42,
     scanEvidence: { source: 'real-debug-endpoint', coverage: { tsc: false, tests: false, security: true, bug: true, ai: false } },
   };
+}
+
+
+function isShowcaseWs(ws: WorkspaceSnapshot | null | undefined): boolean {
+  return Boolean(ws && (ws.sourceType === 'demo' || ws.workspaceId === 'demo-showcase' || ws.workspaceId === 'custom-showcase'));
+}
+
+function simpleUnifiedDiff(oldText: string, newText: string, filePath: string): string {
+  if (oldText === newText) return '';
+  const a = oldText.split('\n');
+  const b = newText.split('\n');
+  const lines: string[] = [`diff --git a/${filePath} b/${filePath}`, `--- a/${filePath}`, `+++ b/${filePath}`, '@@'];
+  for (const l of a) lines.push(`-${l}`);
+  for (const l of b) lines.push(`+${l}`);
+  return lines.join('\n');
+}
+
+function computeShowcaseGitDiff(oldContents: Record<string, string>, newContents: Record<string, string>): string {
+  const paths = Array.from(new Set([...Object.keys(oldContents), ...Object.keys(newContents)])).sort();
+  return paths
+    .map((p) => simpleUnifiedDiff(oldContents[p] ?? '', newContents[p] ?? '', p))
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function withScanEvidence(result: DebugRunResponse): DebugRunResponse {
@@ -480,6 +598,26 @@ export default function App() {
             setIdeError(null);
             return enriched;
           }
+          if (ws.workspaceId === 'custom-showcase') {
+            const enriched = withScanEvidence({
+              workspaceId: ws.workspaceId,
+              subagents: [
+                { id: 'subagent-local', name: 'Local Analyzer', specialty: 'Showcase', color: '#3b82f6', status: 'done', elapsedMs: 10, findingsCount: 0, summary: 'Local showcase scan (no backend).' },
+              ],
+              diagnostics: [],
+              tscResult: { ran: false, filesChecked: ws.files.length, errorCount: 0, warningCount: 0, durationMs: 10, output: 'Showcase mode: backend unavailable. No real tsc/test run.' },
+              testResult: { ran: false, command: 'node --test', exitCode: 0, durationMs: 0, passed: 0, failed: 0, skipped: 0, output: 'Showcase mode: tests not executed without backend.' },
+              terminalLines: ['[showcase] Local upload loaded without backend. Real scan/fix requires Node server.'],
+              gitDiff: computeShowcaseGitDiff({}, ws.fileContents),
+              fileStatuses: ws.fileStatuses ?? {},
+              totalElapsedMs: 10,
+            });
+            setDebugResult(enriched);
+            logScanEvidence(enriched);
+            setCursorAgents(buildIdleAgents(10));
+            setIdeError(null);
+            return enriched;
+          }
           throw new Error(
             data?.error ||
               'Backend unavailable for real scan (this deployed URL is UI/showcase only). Run the Node server for full functionality.'
@@ -502,6 +640,24 @@ export default function App() {
           logScanEvidence(enriched);
           const focusDiag = enriched.diagnostics.find((d) => !d.fixed) ?? enriched.diagnostics[0];
           if (focusDiag?.filePath) routeAgentFileToPane(focusDiag.filePath, true);
+          setCursorAgents(buildIdleAgents(10));
+          setIdeError(null);
+          return enriched;
+        }
+        if (ws.workspaceId === 'custom-showcase') {
+          const enriched = withScanEvidence({
+            workspaceId: ws.workspaceId,
+            subagents: [{ id: 'subagent-local', name: 'Local Analyzer', specialty: 'Showcase', color: '#3b82f6', status: 'done', elapsedMs: 10, findingsCount: 0, summary: 'Local showcase scan (no backend).' }],
+            diagnostics: [],
+            tscResult: { ran: false, filesChecked: ws.files.length, errorCount: 0, warningCount: 0, durationMs: 10, output: 'Showcase mode: backend unavailable. No real tsc/test run.' },
+            testResult: { ran: false, command: 'node --test', exitCode: 0, durationMs: 0, passed: 0, failed: 0, skipped: 0, output: 'Showcase mode: tests not executed without backend.' },
+            terminalLines: ['[showcase] Local upload loaded without backend. Real scan/fix requires Node server.'],
+            gitDiff: computeShowcaseGitDiff(buildClientDemoSnapshot().fileContents, ws.fileContents),
+            fileStatuses: ws.fileStatuses ?? {},
+            totalElapsedMs: 10,
+          });
+          setDebugResult(enriched);
+          logScanEvidence(enriched);
           setCursorAgents(buildIdleAgents(10));
           setIdeError(null);
           return enriched;
@@ -768,21 +924,119 @@ export default function App() {
       setIsSwarmFixing(true);
       setIdeError(null);
       setIsSplitOpen(false);
-      activeWorkFileRef.current = debugResult?.diagnostics.find((d) => !d.fixed)?.filePath ?? '';
+      activeWorkFileRef.current = (debugResult?.diagnostics ?? []).find((d) => !d.fixed)?.filePath ?? ws.files[0]?.path ?? '';
       setCursorAgents(buildIdleAgents(fixedCount));
       setAgentOutputLogs([`$ swarm fix --cursors=${fixedCount} --speed=${speed} (${ws.repoName})`]);
 
+      const runShowcaseFix = async () => {
+        const mult = speed === 'fast' ? 0.25 : speed === 'normal' ? 0.55 : 1;
+        const dly = (ms: number) => sleep(Math.round(ms * mult));
+        let curWs: WorkspaceSnapshot = { ...ws, fileContents: { ...ws.fileContents }, fileStatuses: { ...(ws.fileStatuses ?? {}) } };
+        let scan = withScanEvidence(buildShowcaseDemoScanResult(curWs));
+        const fixable = scan.diagnostics.filter((d) => !d.fixed && (d.suggestedLinePatch || d.suggestedFilePatch));
+        const byFile = new Map<string, typeof fixable>();
+        for (const d of fixable) {
+          const arr = byFile.get(d.filePath) ?? [];
+          arr.push(d);
+          byFile.set(d.filePath, arr);
+        }
+
+        setDebugResult(scan);
+        setAgentOutputLogs((p) => [...p, `[diagnosing] Scanning workspace (showcase)...`, `[diagnostics:ready] ${scan.diagnostics.length} diagnostic(s) found`]);
+
+        if (fixable.length === 0) {
+          setAgentOutputLogs((p) => [...p, `[complete] Workspace clean (showcase).`]);
+          setCursorAgents(buildIdleAgents(10).map((a) => ({ ...a, status: 'done' as const, task: 'No issues to fix' })));
+          return;
+        }
+
+        setAgentOutputLogs((p) => [...p, `[fixing] 10 cursors converged on ${byFile.size} file(s) (showcase)...`]);
+        let fixedTotal = 0;
+
+        for (const [filePath, diags] of byFile.entries()) {
+          activeWorkFileRef.current = filePath;
+          routeAgentFileToPane(filePath, true);
+          const sorted = [...diags].sort((a, b) => b.line - a.line);
+          setCursorAgents((prev) => prev.map((a, i) => ({ ...a, status: 'scanning' as const, filePath, line: Math.max(1, (sorted[0]?.line ?? 1) - i), column: 1, task: `Scanning ${filePath}`, diagnosticId: null })));
+          await dly(180);
+
+          let content = curWs.fileContents[filePath] ?? '';
+          for (let idx = 0; idx < sorted.length; idx++) {
+            const diag = sorted[idx];
+            const writer = SWARM_CURSOR_PROFILES[idx % 10];
+            setCursorAgents((prev) => prev.map((a, i) => ({ ...a, status: i === (idx % 10) ? 'writing' : 'scanning' as const, filePath, line: diag.line, column: 4 + i, task: i === (idx % 10) ? `Fixing ${diag.code} at ${filePath}:${diag.line}` : `Assisting in ${filePath}`, diagnosticId: diag.id })));
+            setAgentOutputLogs((p) => [...p.slice(-180), `[${writer.name}] → ${filePath}:${diag.line} [${diag.code}] ${diag.title}`]);
+            await dly(220);
+
+            const before = content;
+            const after = applyDiagnosticFixToContent(content, diag);
+            if (after !== before) {
+              // streaming effect
+              setStreamingFiles((p) => ({ ...p, [filePath]: true }));
+              const lines = after.split('\n');
+              const steps = Math.min(6, Math.max(3, lines.length));
+              for (let s = 1; s <= steps; s++) {
+                const partial = lines.slice(0, Math.max(1, Math.floor((lines.length * s) / steps))).join('\n') + (s < steps ? '\n' : '');
+                setWorkspace((prev) => prev ? { ...prev, fileContents: { ...prev.fileContents, [filePath]: s === steps ? after : partial } } : prev);
+                setCursorAgents((prev) => prev.map((a, i) => ({ ...a, status: i === (idx % 10) ? 'writing' : 'scanning' as const, line: Math.min(diag.line, 1 + Math.floor((s / steps) * Math.max(1, diag.line))), column: 6 + s * 3 + i })));
+                await dly(90);
+              }
+              content = after;
+              curWs = { ...curWs, fileContents: { ...curWs.fileContents, [filePath]: content }, fileStatuses: { ...(curWs.fileStatuses ?? {}), [filePath]: 'M' } };
+              setStreamingFiles((p) => ({ ...p, [filePath]: false }));
+              setWorkspace(curWs);
+              setDebugResult((prev) => prev ? { ...prev, gitDiff: computeShowcaseGitDiff(buildClientDemoSnapshot().fileContents, curWs.fileContents), fileStatuses: curWs.fileStatuses } : prev);
+              setAgentOutputLogs((p) => [...p.slice(-180), `[${writer.name}] Patched ${filePath}:${diag.line} (showcase)`]);
+              fixedTotal++;
+              await dly(120);
+            }
+          }
+
+          setCursorAgents((prev) => prev.map((a) => ({ ...a, status: 'verifying' as const, filePath, task: `Verifying ${filePath}`, diagnosticId: null })));
+          await dly(220);
+          scan = withScanEvidence(buildShowcaseDemoScanResult(curWs));
+          scan.gitDiff = computeShowcaseGitDiff(buildClientDemoSnapshot().fileContents, curWs.fileContents);
+          scan.fileStatuses = curWs.fileStatuses;
+          setDebugResult(scan);
+          setWorkspace(curWs);
+        }
+
+        setAgentOutputLogs((p) => [...p.slice(-180), `[verifying] Final showcase re-scan...`]);
+        await dly(200);
+        const finalScan = withScanEvidence(buildShowcaseDemoScanResult(curWs));
+        finalScan.gitDiff = computeShowcaseGitDiff(buildClientDemoSnapshot().fileContents, curWs.fileContents);
+        finalScan.fileStatuses = curWs.fileStatuses;
+        setDebugResult(finalScan);
+        setCursorAgents((prev) => prev.map((a) => ({ ...a, status: 'done' as const, filePath: null, diagnosticId: null, task: `Applied ${fixedTotal} verified patch(es)` })));
+        setAgentOutputLogs((p) => [...p.slice(-180), `[complete] Verified ${fixedTotal} patch(es), ${finalScan.diagnostics.length} diagnostic(s) remain (showcase).`]);
+        const focus = finalScan.diagnostics[0]?.filePath ?? ws.files[0]?.path;
+        if (focus) routeAgentFileToPane(focus, true);
+        logScanEvidence(finalScan);
+      };
+
       try {
-        const resp = await fetch(`/api/repo/${ws.workspaceId}/swarm-fix`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ agentCount: fixedCount, speed, useAi: true }),
-        });
-        await consumeSwarmSse(ws, resp);
-        // Ensure verified server-reported state after stream end.
-        await runScanOnWorkspace(ws);
+        if (isShowcaseWs(ws)) {
+          await runShowcaseFix();
+        } else {
+          const resp = await fetch(`/api/repo/${ws.workspaceId}/swarm-fix`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ agentCount: fixedCount, speed, useAi: true }),
+          });
+          if (!resp.ok || !resp.body) {
+            if (isShowcaseWs(ws)) await runShowcaseFix();
+            else throw new Error((await safeReadJson<{error?:string}>(resp))?.error || 'Swarm stream failed.');
+          } else {
+            await consumeSwarmSse(ws, resp);
+            await runScanOnWorkspace(ws);
+          }
+        }
       } catch (err) {
-        setIdeError(err instanceof Error ? err.message : 'Swarm execution failed.');
+        if (isShowcaseWs(ws)) {
+          try { await runShowcaseFix(); } catch (e) { setIdeError(e instanceof Error ? e.message : 'Swarm execution failed.'); }
+        } else {
+          setIdeError(err instanceof Error ? err.message : 'Swarm execution failed.');
+        }
       } finally {
         setIsSwarmFixing(false);
         setStreamingFiles({});
@@ -790,7 +1044,7 @@ export default function App() {
         setCursorAgents(buildIdleAgents(10));
       }
     },
-    [consumeSwarmSse, debugResult?.diagnostics, runScanOnWorkspace]
+    [consumeSwarmSse, debugResult, logScanEvidence, routeAgentFileToPane, runScanOnWorkspace]
   );
 
   const runFeatureBuildOnWorkspace = useCallback(
@@ -807,16 +1061,85 @@ export default function App() {
         `$ swarm build "${prompt}" --cursors=${fixedCount} --speed=${speed}`,
       ]);
 
-      try {
-        const resp = await fetch(`/api/repo/${ws.workspaceId}/composer`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt, agentCount: fixedCount, speed, useAi: true }),
+      const runShowcaseBuild = async () => {
+        const mult = speed === 'fast' ? 0.25 : speed === 'normal' ? 0.55 : 1;
+        const dly = (ms: number) => sleep(Math.round(ms * mult));
+        const slug = (prompt.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24)) || 'feature';
+        const filePath = `src/${slug}.ts`;
+        const content = [
+          `// Generated in showcase mode for: ${prompt}`,
+          '',
+          'export function runFeature() {',
+          `  return ${JSON.stringify(prompt)};`,
+          '}',
+          '',
+        ].join('\n');
+        const steps = [{ id: 'step-1', filePath, action: 'create' as const, description: `Create ${filePath} (showcase)`, agentId: SWARM_CURSOR_PROFILES[0].id, status: 'pending' as const }];
+        setComposerPlan({ prompt, summary: `Planned 1 file for "${prompt}" (showcase)`, steps });
+        setAgentOutputLogs((p) => [...p, '[planning] Building one-file plan (showcase)...', `[composer:plan] ${filePath}`]);
+        await dly(250);
+
+        activeWorkFileRef.current = filePath;
+        routeAgentFileToPane(filePath, true);
+        setComposerPlan({ prompt, summary: `Building ${filePath} (showcase)`, steps: [{ ...steps[0], status: 'in_progress' }] });
+        setAgentOutputLogs((p) => [...p, `[writing] Creating ${filePath}...`]);
+
+        const lines = content.split('\n');
+        let partial = '';
+        for (let i = 0; i < lines.length; i++) {
+          partial += (i === 0 ? '' : '\n') + lines[i];
+          setStreamingFiles((p) => ({ ...p, [filePath]: true }));
+          setCursorAgents((prev) => prev.map((a, idx) => ({ ...a, status: idx === 0 ? 'writing' : 'scanning', filePath, line: i + 1, column: Math.max(1, lines[i].length), task: idx === 0 ? `Writing ${filePath}:${i + 1}` : `Assisting ${filePath}` })));
+          setWorkspace((prev) => {
+            if (!prev) return prev;
+            const exists = prev.files.some((f) => f.path === filePath);
+            const node = { path: filePath, name: filePath.split('/').pop() || filePath, language: 'typescript', size: partial.length, lineCount: partial.split('\n').length, diagnosticCount: 0 };
+            return { ...prev, files: exists ? prev.files.map(f=>f.path===filePath?node:f) : [...prev.files, node], fileContents: { ...prev.fileContents, [filePath]: partial } };
+          });
+          await dly(60);
+        }
+
+        setStreamingFiles((p) => ({ ...p, [filePath]: false }));
+        setWorkspace((prev) => {
+          if (!prev) return prev;
+          const nextContents = { ...prev.fileContents, [filePath]: content };
+          const nextStatuses = { ...(prev.fileStatuses ?? {}), [filePath]: 'A' as GitFileStatus };
+          return { ...prev, fileContents: nextContents, fileStatuses: nextStatuses };
         });
-        await consumeSwarmSse(ws, resp);
-        await runScanOnWorkspace(ws);
+        setComposerPlan({ prompt, summary: `Created ${filePath} (showcase)`, steps: [{ ...steps[0], status: 'done' }] });
+        setAgentOutputLogs((p) => [...p, `[verifying] Checking generated file (showcase)...`, `[complete] Created ${filePath} (showcase).`]);
+        await dly(150);
+        const finalWs = ((): WorkspaceSnapshot | null => {
+          // best-effort: build from current workspace state is async in React; rescan will read latest via closure in many cases, but easier to refresh after
+          return null;
+        })();
+        void finalWs;
+        await runScanOnWorkspace({ ...ws, fileContents: { ...ws.fileContents, [filePath]: content }, fileStatuses: { ...(ws.fileStatuses ?? {}), [filePath]: 'A' }, files: [...ws.files.filter(f=>f.path!==filePath), { path: filePath, name: filePath.split('/').pop()||filePath, language:'typescript', size: content.length, lineCount: content.split('\n').length, diagnosticCount: 0 }] });
+      };
+
+      try {
+        if (isShowcaseWs(ws)) {
+          await runShowcaseBuild();
+        } else {
+          const resp = await fetch(`/api/repo/${ws.workspaceId}/composer`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, agentCount: fixedCount, speed, useAi: true }),
+          });
+          if (!resp.ok || !resp.body) {
+            if (isShowcaseWs(ws)) await runShowcaseBuild();
+            else throw new Error((await safeReadJson<{error?:string}>(resp))?.error || 'Feature build failed.');
+          } else {
+            await consumeSwarmSse(ws, resp);
+            await runScanOnWorkspace(ws);
+          }
+        }
       } catch (err) {
-        setIdeError(err instanceof Error ? err.message : 'Feature build failed.');
+        if (isShowcaseWs(ws)) {
+          try { await runShowcaseBuild(); } catch (e) { setIdeError(e instanceof Error ? e.message : 'Feature build failed.'); }
+        } else {
+          setIdeError(err instanceof Error ? err.message : 'Feature build failed.');
+        }
       } finally {
         setIsBuildingFeature(false);
         setStreamingFiles({});
@@ -824,7 +1147,7 @@ export default function App() {
         setCursorAgents(buildIdleAgents(10));
       }
     },
-    [consumeSwarmSse, runScanOnWorkspace]
+    [consumeSwarmSse, routeAgentFileToPane, runScanOnWorkspace]
   );
 
   const handleImportWorkspaceSnapshot = useCallback(
@@ -859,19 +1182,49 @@ export default function App() {
           }
           if (!data) data = buildClientDemoSnapshot();
         } else {
-          const resp = await fetch('/api/repo/import', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          });
-          const parsed = await safeReadJson<WorkspaceSnapshot & { error?: string }>(resp);
-          if (!resp.ok || !parsed) {
-            throw new Error(
-              parsed?.error ||
-                'Backend unavailable for repository import (this deployed URL is UI/showcase only). Run the Node server to clone/import and scan real repos.'
-            );
+          let parsed: (WorkspaceSnapshot & { error?: string }) | null = null;
+          try {
+            const resp = await fetch('/api/repo/import', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+            parsed = await safeReadJson<WorkspaceSnapshot & { error?: string }>(resp);
+            if (resp.ok && parsed && !(parsed as { error?: string }).error) data = parsed as WorkspaceSnapshot;
+          } catch {
+            parsed = null;
           }
-          data = parsed as WorkspaceSnapshot;
+          if (!data) {
+            if (payload.source === 'custom' && payload.files?.length) {
+              const fileContents: Record<string, string> = {};
+              const files: RepoFileNode[] = payload.files.map((f) => {
+                fileContents[f.path] = f.content;
+                return {
+                  path: f.path,
+                  name: f.path.split('/').pop() ?? f.path,
+                  language: inferLanguage(f.path),
+                  size: f.content.length,
+                  lineCount: f.content.split('\n').length,
+                  diagnosticCount: 0,
+                };
+              });
+              data = {
+                workspaceId: 'custom-showcase',
+                repoName: payload.name || 'custom/uploaded-files',
+                repoUrl: 'local://uploaded',
+                sourceType: 'custom',
+                branch: 'main',
+                files,
+                fileContents,
+                fileStatuses: {},
+              };
+            } else {
+              throw new Error(
+                parsed?.error ||
+                  'Backend unavailable for repository import (this deployed URL is UI/showcase only). Use Demo/Upload, or run the Node server to clone/import real repos.'
+              );
+            }
+          }
         }
 
         const { primary, secondary } = pickInitialFiles(data);
@@ -908,6 +1261,25 @@ export default function App() {
       setIsApplying(true);
       setIdeError(null);
       try {
+        if (isShowcaseWs(workspace)) {
+          const content = `// ${filePath}\n`;
+          const fileNode: RepoFileNode = {
+            path: filePath,
+            name: filePath.split('/').pop() ?? filePath,
+            language: inferLanguage(filePath),
+            size: content.length,
+            lineCount: content.split('\n').length,
+            diagnosticCount: 0,
+          };
+          const nextFiles = [...workspace.files.filter((f) => f.path !== filePath), fileNode].sort((a,b)=>a.path.localeCompare(b.path));
+          const nextContents = { ...workspace.fileContents, [filePath]: content };
+          const nextStatuses = { ...(workspace.fileStatuses ?? {}), [filePath]: 'A' as GitFileStatus };
+          const nextWs = { ...workspace, files: nextFiles, fileContents: nextContents, fileStatuses: nextStatuses };
+          setWorkspace(nextWs);
+          setDebugResult((prev) => prev ? { ...prev, gitDiff: computeShowcaseGitDiff(buildClientDemoSnapshot().fileContents, nextContents), fileStatuses: nextStatuses } : prev);
+          openFileInPane(filePath, focusedPane);
+          return;
+        }
         const resp = await fetch(`/api/repo/${workspace.workspaceId}/create-file`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -950,6 +1322,36 @@ export default function App() {
       if (!workspace) return;
       setIsRunningCommand(true);
       try {
+        if (isShowcaseWs(workspace)) {
+          const cmd = command.trim();
+          let output = '';
+          let exitCode = 0;
+          const files = workspace.files.map((f) => f.path).sort().join('\n');
+          if (cmd === 'ls' || cmd === 'dir') output = files || '(empty)';
+          else if (cmd === 'help') output = 'Available (showcase): help, ls, git status, git diff, tsc --noEmit, tsx --test, node --test, cat <file>';
+          else if (cmd === 'git status') {
+            const changed = Object.keys(workspace.fileStatuses ?? {});
+            output = changed.length ? `On branch main\nChanges:\n${changed.map(p=>` M ${p}`).join('\n')}` : 'On branch main\nnothing to commit, working tree clean';
+          } else if (cmd === 'git diff') {
+            output = debugResult?.gitDiff || computeShowcaseGitDiff(buildClientDemoSnapshot().fileContents, workspace.fileContents) || '(no changes)';
+          } else if (cmd === 'tsc --noEmit') {
+            const errs = (debugResult?.diagnostics ?? []).filter(d=>!d.fixed && d.severity==='error');
+            output = errs.length ? errs.map(d=>`${d.filePath}:${d.line}:${d.column} - error ${d.code}: ${d.message}`).join('\n') : 'No TypeScript errors (showcase).';
+            exitCode = errs.length ? 1 : 0;
+          } else if (cmd === 'tsx --test' || cmd === 'node --test') {
+            output = debugResult?.testResult?.output || 'No tests executed in showcase mode.';
+          } else if (cmd.startsWith('cat ')) {
+            const p = cmd.slice(4).trim();
+            output = workspace.fileContents[p] ?? `cat: ${p}: No such file`;
+            if (!workspace.fileContents[p]) exitCode = 1;
+          } else {
+            output = 'Command not available in Vercel showcase mode. Run the Node backend for real terminal commands.';
+            exitCode = 1;
+          }
+          setTerminalHistory((prev) => [...prev.slice(-30), { command, output, exitCode }]);
+          setAgentOutputLogs((prev) => [...prev.slice(-180), `$ ${command}`, ...(output ? output.split('\n').slice(0, 12) : ['(no output)'])]);
+          return;
+        }
         const resp = await fetch(`/api/repo/${workspace.workspaceId}/run-command`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -973,7 +1375,7 @@ export default function App() {
         setIsRunningCommand(false);
       }
     },
-    [workspace]
+    [debugResult, workspace]
   );
 
   const applyWorkspacePatch = useCallback(
@@ -985,7 +1387,7 @@ export default function App() {
       if (!workspace) return;
       const beforeDiagnostics = debugResult?.diagnostics ?? [];
       const targetIds = opts.applyAll
-        ? new Set(beforeDiagnostics.filter((d) => !d.fixed && d.suggestedLinePatch).map((d) => d.id))
+        ? new Set(beforeDiagnostics.filter((d) => !d.fixed && (d.suggestedLinePatch || d.suggestedFilePatch)).map((d) => d.id))
         : opts.diagnosticId
           ? new Set([opts.diagnosticId])
           : new Set<string>();
@@ -1006,17 +1408,71 @@ export default function App() {
             opts.manualEdit?.filePath ??
             beforeDiagnostics.find((d) => targetIds.has(d.id))?.filePath ??
             a.filePath,
-          task: opts.manualEdit ? 'Applying manual edit (real backend write)' : 'Applying real backend repair',
+          task: opts.manualEdit ? 'Applying manual edit (local workspace write)' : 'Applying repair (local showcase mode)',
           diagnosticId: opts.diagnosticId ?? null,
         }))
       );
       setAgentOutputLogs((prev) => [
         ...prev.slice(-180),
         opts.manualEdit
-          ? `[apply-fix] real backend write for ${opts.manualEdit.filePath}`
-          : `[apply-fix] real backend repair attempt (${opts.applyAll ? 'all fixable diagnostics' : opts.diagnosticId ?? 'single'})`,
+          ? `[apply-fix] writing ${opts.manualEdit.filePath}`
+          : `[apply-fix] repair attempt (${opts.applyAll ? 'all fixable diagnostics' : opts.diagnosticId ?? 'single'})`,
       ]);
+
+      const applyShowcaseLocal = () => {
+        const prevContents = { ...workspace.fileContents };
+        let nextContents = { ...workspace.fileContents };
+        let appliedCount = 0;
+
+        if (opts.manualEdit) {
+          if (nextContents[opts.manualEdit.filePath] !== opts.manualEdit.content) {
+            nextContents = { ...nextContents, [opts.manualEdit.filePath]: opts.manualEdit.content };
+            appliedCount = 1;
+          }
+        } else if (opts.applyAll) {
+          const { updatedFiles, appliedIds } = applyAllFixesToFiles(nextContents, beforeDiagnostics.filter((d) => !d.fixed));
+          nextContents = { ...nextContents, ...updatedFiles };
+          appliedCount = appliedIds.size;
+        } else if (opts.diagnosticId) {
+          const d = beforeDiagnostics.find((x) => x.id === opts.diagnosticId);
+          if (d && (d.suggestedLinePatch || d.suggestedFilePatch)) {
+            const before = nextContents[d.filePath] ?? '';
+            const after = applyDiagnosticFixToContent(before, d);
+            if (after !== before) {
+              nextContents = { ...nextContents, [d.filePath]: after };
+              appliedCount = 1;
+            }
+          }
+        }
+
+        const changedPaths = Object.keys(nextContents).filter((p) => nextContents[p] !== prevContents[p]);
+        const nextStatuses: Record<string, GitFileStatus> = { ...(workspace.fileStatuses ?? {}) };
+        for (const p of changedPaths) nextStatuses[p] = nextStatuses[p] ?? 'M';
+
+        const nextWs: WorkspaceSnapshot = {
+          ...workspace,
+          fileContents: nextContents,
+          fileStatuses: nextStatuses,
+        };
+        setWorkspace(nextWs);
+        const scan = withScanEvidence(buildShowcaseDemoScanResult(nextWs));
+        const reconciled = reconcileAfterFixScan(beforeDiagnostics, scan, targetIds);
+        reconciled.gitDiff = computeShowcaseGitDiff(buildClientDemoSnapshot().fileContents, nextContents);
+        setDebugResult(reconciled);
+        const remaining = reconciled.diagnostics.filter((d) => !d.fixed).length;
+        const verified = reconciled.diagnostics.filter((d) => d.verificationStatus === 'verified').length;
+        const unfixable = reconciled.diagnostics.filter((d) => d.verificationStatus === 'unfixable').length;
+        setAgentOutputLogs((prev) => [
+          ...prev.slice(-180),
+          `[apply-fix] local result: applied=${appliedCount}, verified=${verified}, unfixable=${unfixable}, remaining=${remaining}`,
+        ]);
+      };
+
       try {
+        if (isShowcaseWs(workspace)) {
+          applyShowcaseLocal();
+          return;
+        }
         const resp = await fetch(`/api/repo/${workspace.workspaceId}/apply-fix`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1027,6 +1483,7 @@ export default function App() {
         });
         const data = await safeReadJson<ApplyFixResponse & { error?: string }>(resp);
         if (!resp.ok || !data) {
+          if (isShowcaseWs(workspace)) { applyShowcaseLocal(); return; }
           throw new Error(data?.error || 'Backend unavailable (showcase/static deploy cannot apply real fixes).');
         }
 
@@ -1040,7 +1497,6 @@ export default function App() {
             : prev
         );
 
-        // Refresh with verified results from real server scan (no optimistic fixed state).
         const verifiedScan = await runScanOnWorkspace({
           ...workspace,
           fileContents: { ...workspace.fileContents, ...data.updatedFiles },
@@ -1060,19 +1516,38 @@ export default function App() {
           setDebugResult((prev) => (prev ? { ...prev, gitDiff: data.gitDiff } : prev));
         }
       } catch (err) {
-        setIdeError(err instanceof Error ? err.message : 'Patch write failed.');
+        if (isShowcaseWs(workspace)) {
+          try { applyShowcaseLocal(); } catch (e) { setIdeError(e instanceof Error ? e.message : 'Patch failed.'); }
+        } else {
+          setIdeError(err instanceof Error ? err.message : 'Patch write failed.');
+        }
       } finally {
         setIsApplying(false);
         setCursorAgents(buildIdleAgents(10));
       }
     },
-    [debugResult?.diagnostics, routeAgentFileToPane, runScanOnWorkspace, workspace]
+    [debugResult, routeAgentFileToPane, runScanOnWorkspace, workspace]
   );
 
   const handleResetGit = useCallback(async () => {
     if (!workspace) return;
     setIsApplying(true);
     try {
+      if (isShowcaseWs(workspace)) {
+        const nextWs = buildClientDemoSnapshot();
+        const { primary, secondary } = pickInitialFiles(nextWs);
+        activeWorkFileRef.current = '';
+        setWorkspace(nextWs);
+        setComposerPlan(null);
+        setPrimaryTabs(primary ? [primary] : []);
+        setPrimaryActiveFile(primary);
+        setSecondaryTabs(secondary ? [secondary] : []);
+        setSecondaryActiveFile(secondary);
+        setCursorAgents(buildIdleAgents(10));
+        setAgentOutputLogs(['Git working tree reset to clean showcase baseline.']);
+        await runScanOnWorkspace(nextWs);
+        return;
+      }
       const resp = await fetch(`/api/repo/${workspace.workspaceId}/reset`, { method: 'POST' });
       const data = await safeReadJson<{
         files: WorkspaceSnapshot['files'];
