@@ -199,7 +199,7 @@ export function applyAllFixesToFiles(
   const byFile = new Map<string, CodeDiagnostic[]>();
   for (const diag of diagnostics) {
     if (diag.fixed) continue;
-    if (!diag.suggestedFilePatch && !diag.suggestedFilePatch && !diag.suggestedLinePatch) continue;
+    if (!diag.suggestedFilePatch && !diag.suggestedLinePatch) continue;
     const list = byFile.get(diag.filePath) ?? [];
     list.push(diag);
     byFile.set(diag.filePath, list);
@@ -212,7 +212,8 @@ export function applyAllFixesToFiles(
     const fullFileDiag = list.find((d) => Boolean(d.suggestedFilePatch));
     if (fullFileDiag?.suggestedFilePatch) {
       updatedFiles[filePath] = fullFileDiag.suggestedFilePatch;
-      for (const d of list) appliedIds.add(d.id);
+      // Only mark the diagnostic whose patch was actually applied; others may not be covered.
+      appliedIds.add(fullFileDiag.id);
       continue;
     }
 

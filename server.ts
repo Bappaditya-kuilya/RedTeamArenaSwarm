@@ -49,9 +49,23 @@ app.use('/api', (req, res, next) => {
     .map((s) => s.trim())
     .filter(Boolean);
   for (const o of envOrigins) allowed.add(o);
-  if (origin && (allowed.has(origin) || /\.vercel\.app$/.test(new URL(origin).hostname))) {
+
+  let allowOrigin = false;
+  if (origin) {
+    if (allowed.has(origin)) {
+      allowOrigin = true;
+    } else {
+      try {
+        allowOrigin = /\.vercel\.app$/i.test(new URL(origin).hostname);
+      } catch {
+        allowOrigin = false;
+      }
+    }
+  }
+
+  res.setHeader('Vary', 'Origin');
+  if (allowOrigin && origin) {
     res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -402,7 +416,8 @@ async function startServer() {
   } else {
     const distDir = path.resolve(__dirname, 'dist');
     app.use(express.static(distDir));
-    app.get('/{*splat}', (_req, res) => {
+    // Express 4-compatible SPA fallback (exclude /api)
+    app.get(/^\/(?!api(?:\/|$)).*/, (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }

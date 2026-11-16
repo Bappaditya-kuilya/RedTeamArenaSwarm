@@ -77,7 +77,13 @@ export function EditorPane({
   useEffect(() => {
     setManualDraft(activeContent);
     setIsEditingManual(false);
-  }, [activeFilePath, activeContent]);
+  }, [activeFilePath]);
+
+  useEffect(() => {
+    if (!isEditingManual) {
+      setManualDraft(activeContent);
+    }
+  }, [activeContent, isEditingManual]);
 
   useEffect(() => {
     activeTabRef.current?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
@@ -481,7 +487,7 @@ export function EditorPane({
                     </div>
 
                     {/* Inline diagnostic annotation */}
-                    {openDiag && lineCursors.length === 0 && !isSplitActive && (
+                    {openDiag && lineCursors.length === 0 && (
                       <span className="ml-6 inline-flex items-center gap-2 shrink-0 text-[12px] font-sans max-w-[420px]">
                         <span
                           className={`truncate ${

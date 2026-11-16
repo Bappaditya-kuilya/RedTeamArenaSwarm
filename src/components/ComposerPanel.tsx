@@ -73,8 +73,6 @@ export function ComposerPanel({
   onJumpToFile,
   onShowDiff,
 }: ComposerPanelProps) {
-  void onChangeAgentCount;
-  void agentCount;
   const [promptInput, setPromptInput] = useState('');
 
   const busy = isSwarmFixing || isBuildingFeature || isImporting;
@@ -114,9 +112,24 @@ export function ComposerPanel({
       </div>
 
       <div className="px-3 py-2 border-b border-[#1e1e1e] flex items-center justify-between gap-2 shrink-0">
-        <div className="flex items-center gap-1.5 text-[12px] text-[#cccccc]">
-          <span className="text-[#969696]">Cursors</span>
-          <span className="px-2 py-0.5 rounded bg-[#3c3c3c] font-mono text-[11px]">10</span>
+        <div className="flex items-center gap-1.5">
+          <label className="text-[12px] text-[#969696]" htmlFor="composer-agent-count">
+            Cursors
+          </label>
+          <select
+            id="composer-agent-count"
+            aria-label="Cursor Count"
+            value={agentCount}
+            disabled={busy}
+            onChange={(e) => onChangeAgentCount(Number(e.target.value))}
+            className="h-7 px-2 text-[12px] rounded bg-[#3c3c3c] border border-[#3c3c3c] text-[#cccccc] focus:outline-none focus:border-[#007acc]"
+          >
+            {[1, 2, 4, 6, 8, 10].map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
         </div>
 
         <div className="flex items-center gap-1.5">

@@ -702,7 +702,13 @@ export default function App() {
           const rawJson = line.slice(6).trim();
           if (!rawJson) continue;
 
-          const evt = JSON.parse(rawJson) as SwarmStreamEvent;
+          let evt: SwarmStreamEvent;
+          try {
+            evt = JSON.parse(rawJson) as SwarmStreamEvent;
+          } catch {
+            setAgentOutputLogs((prev) => [...prev.slice(-180), '[sse] dropped malformed event']);
+            continue;
+          }
 
           if (evt.type === 'phase') {
             setAgentOutputLogs((prev) => [...prev.slice(-180), `[${evt.phase}] ${evt.message}`]);
@@ -1490,23 +1496,26 @@ export default function App() {
           throw new Error(data?.error || 'Backend unavailable (showcase/static deploy cannot apply real fixes).');
         }
 
-        setWorkspace((prev) =>
-          prev
-            ? {
-                ...prev,
-                fileContents: { ...prev.fileContents, ...data.updatedFiles },
-                fileStatuses: data.fileStatuses ?? prev.fileStatuses,
-              }
-            : prev
-        );
-
-        const verifiedScan = await runScanOnWorkspace({
+        const mergedWs: WorkspaceSnapshot = {
           ...workspace,
           fileContents: { ...workspace.fileContents, ...data.updatedFiles },
           fileStatuses: data.fileStatuses ?? workspace.fileStatuses,
-        });
-        if (verifiedScan) {
-          const reconciled = reconcileAfterFixScan(beforeDiagnostics, verifiedScan, targetIds);
+        };
+        setWorkspace(mergedWs);
+
+        if (Array.isArray((data as any).diagnostics)) {
+          const serverScan = withScanEvidence({
+            workspaceId: workspace.workspaceId,
+            diagnostics: (data as any).diagnostics as CodeDiagnostic[],
+            subagents: debugResult?.subagents ?? [],
+            tscResult: debugResult?.tscResult ?? { ran: false, filesChecked: 0, errorCount: 0, warningCount: 0, durationMs: 0, output: '' },
+            testResult: debugResult?.testResult ?? { ran: false, command: 'none', exitCode: 0, durationMs: 0, passed: 0, failed: 0, skipped: 0, output: '' },
+            terminalLines: debugResult?.terminalLines ?? [],
+            gitDiff: data.gitDiff ?? debugResult?.gitDiff ?? '',
+            fileStatuses: data.fileStatuses ?? mergedWs.fileStatuses,
+            totalElapsedMs: debugResult?.totalElapsedMs ?? 0,
+          });
+          const reconciled = reconcileAfterFixScan(beforeDiagnostics, serverScan, targetIds);
           setDebugResult(reconciled);
           const remaining = reconciled.diagnostics.filter((d) => !d.fixed).length;
           const verified = reconciled.diagnostics.filter((d) => d.verificationStatus === 'verified').length;
@@ -1516,7 +1525,20 @@ export default function App() {
             `[apply-fix] server-verified result: applied=${data.appliedCount}, verified=${verified}, unfixable=${unfixable}, remaining=${remaining}`,
           ]);
         } else {
-          setDebugResult((prev) => (prev ? { ...prev, gitDiff: data.gitDiff } : prev));
+          const verifiedScan = await runScanOnWorkspace(mergedWs);
+          if (verifiedScan) {
+            const reconciled = reconcileAfterFixScan(beforeDiagnostics, verifiedScan, targetIds);
+            setDebugResult(reconciled);
+            const remaining = reconciled.diagnostics.filter((d) => !d.fixed).length;
+            const verified = reconciled.diagnostics.filter((d) => d.verificationStatus === 'verified').length;
+            const unfixable = reconciled.diagnostics.filter((d) => d.verificationStatus === 'unfixable').length;
+            setAgentOutputLogs((prev) => [
+              ...prev.slice(-180),
+              `[apply-fix] server-verified result: applied=${data.appliedCount}, verified=${verified}, unfixable=${unfixable}, remaining=${remaining}`,
+            ]);
+          } else {
+            setDebugResult((prev) => (prev ? { ...prev, gitDiff: data.gitDiff } : prev));
+          }
         }
       } catch (err) {
         if (isShowcaseWs(workspace)) {

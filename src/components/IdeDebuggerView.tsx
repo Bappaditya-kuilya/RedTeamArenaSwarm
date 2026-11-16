@@ -1231,7 +1231,8 @@ export function IdeDebuggerView({
             type="button"
             onClick={() => {
               setBottomOpen(true);
-              setBottomTab('scm' as any);
+              setBottomOpen(true);
+              setBottomTab('diff');
               setSidebarMode('scm');
               setLeftSidebarOpen(true);
             }}
