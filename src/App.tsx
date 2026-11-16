@@ -1221,7 +1221,7 @@ export default function App() {
             } else {
               throw new Error(
                 parsed?.error ||
-                  'Backend unavailable for repository import (this deployed URL is UI/showcase only). Use Demo/Upload, or run the Node server to clone/import real repos.'
+                  'Repository import failed (backend unavailable, request timed out, or repo is too large/private for this deployment). If you are on Vercel, use the Render backend URL for real clones. On Render free tier, try a smaller public repo or run locally.'
               );
             }
           }
