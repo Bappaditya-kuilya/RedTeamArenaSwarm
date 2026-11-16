@@ -308,29 +308,31 @@ export function SwarmCursorsOverlay({
 
         const colDiff = targetCol - sim.animCol;
         if (workingNow && (!isWorkStatus || status === 'navigating')) {
-          // helper: small, precise adjustments (no fast looping across the line)
-          if (Math.abs(colDiff) > 0.15) sim.animCol += clamp(colDiff, -dt * 10, dt * 10);
-          sim.animCol += Math.sin(tSec * 1.6 + idx) * dt * 0.25;
-        } else if (status === 'writing' || status === 'editing') {
-          // typing: smooth advance toward target column, then tiny caret pulse
-          const typeRate = 8 * speedFactor;
-          if (Math.abs(colDiff) > 0.12) {
-            sim.animCol += clamp(colDiff, -dt * (10 + Math.min(18, Math.abs(colDiff) * 4)), dt * (10 + Math.min(18, Math.abs(colDiff) * 4)));
-          } else {
-            sim.animCol += Math.sin(tSec * 5.5 + idx) * dt * 0.18;
-          }
-          if (workingNow && Math.abs(colDiff) < 0.2) sim.animCol += dt * typeRate * 0.08; // subtle progress, not sweeping
-        } else if (status === 'scanning') {
-          if (Math.abs(colDiff) > 0.15) sim.animCol += clamp(colDiff, -dt * 14, dt * 14);
-          sim.animCol += Math.sin(tSec * 1.1 + idx) * dt * 0.5;
-        } else if (status === 'verifying') {
+          // helper: stay near active work and keep gentle forward motion
           if (Math.abs(colDiff) > 0.15) sim.animCol += clamp(colDiff, -dt * 12, dt * 12);
-          sim.animCol += Math.sin(tSec * 0.9 + idx) * dt * 0.35;
+          sim.animCol += dt * (1.2 + (idx % 3) * 0.25);
+        } else if (status === 'writing' || status === 'editing') {
+          // typing: follow reported target quickly and keep advancing along the typing place
+          const typeRate = (9 + (idx % 4)) * speedFactor;
+          if (colDiff > 0.12) {
+            // move toward newer/reported cursor position (including jumps forward as typing progresses)
+            sim.animCol += Math.min(colDiff, dt * (14 + colDiff * 8));
+          } else if (colDiff < -0.12) {
+            sim.animCol += Math.max(colDiff, -dt * 18);
+          } else {
+            // when target updates are sparse, continue typing forward smoothly on the same line
+            sim.animCol += dt * typeRate * (0.7 + 0.3 * Math.max(0, Math.sin(tSec * 7 + idx)));
+          }
+        } else if (status === 'scanning') {
+          if (Math.abs(colDiff) > 0.15) sim.animCol += clamp(colDiff, -dt * 18, dt * 18);
+          sim.animCol += dt * (2.2 + (idx % 3) * 0.4) * (0.6 + 0.4 * Math.sin(tSec * 1.2 + idx));
+        } else if (status === 'verifying') {
+          if (Math.abs(colDiff) > 0.15) sim.animCol += clamp(colDiff, -dt * 14, dt * 14);
+          sim.animCol += dt * 1.4 * (0.5 + 0.5 * Math.sin(tSec * 1.1 + idx));
         } else {
           if (workingNow) {
-            // calm presence near target
-            if (Math.abs(colDiff) > 0.2) sim.animCol += clamp(colDiff, -dt * 8, dt * 8);
-            sim.animCol += Math.sin(tSec * 0.8 + idx) * dt * 0.2;
+            if (Math.abs(colDiff) > 0.2) sim.animCol += clamp(colDiff, -dt * 10, dt * 10);
+            sim.animCol += dt * 0.8;
           } else {
             sim.animCol += clamp(colDiff, -dt * 16, dt * 16);
           }
