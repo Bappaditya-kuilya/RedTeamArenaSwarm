@@ -8,7 +8,7 @@ WORKDIR /app
 
 # Install deps (including dev deps needed for build/types where applicable)
 COPY package.json package-lock.json* bun.lock* ./
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+RUN if [ -f package-lock.json ]; then npm ci; else npm install --legacy-peer-deps; fi
 
 # Copy source and build frontend
 COPY . .
