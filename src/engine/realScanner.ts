@@ -118,7 +118,8 @@ const SCANNER_RULES: ScannerRule[] = [
     attackVector: '; cat /etc/passwd #',
     impact: 'Arbitrary shell commands can execute on the host container with server privileges.',
     remediation: 'Use execFile/spawn with an explicit argument array and shell: false, plus input allowlisting.',
-    patchLine: (line) => line.replace(/execSync\s*\(/g, 'execFileSync(/* allowlisted bin, args[], { shell: false } */ ') + ' // hardened: avoid shell interpolation',
+    // Avoid emitting a broken/non-functional auto-fix; manual remediation required.
+    patchLine: (line) => line,
   },
   {
     ruleId: 'RTA-EVAL-004',
@@ -146,7 +147,7 @@ const SCANNER_RULES: ScannerRule[] = [
     attackVector: '../../etc/passwd',
     impact: 'Directory traversal sequences escape intended asset root and expose server files.',
     remediation: 'Resolve canonical path with path.resolve(BASE_DIR, safeName) and verify prefix startsWith(BASE_DIR).',
-    patchLine: (line) => `${line} // TODO: enforce path.resolve(SAFE_ROOT, path.basename(input))`,
+    patchLine: (line) => line, // comment-only TODO is not a safe auto-fix
   },
   {
     ruleId: 'RTA-SSRF-006',
@@ -160,7 +161,7 @@ const SCANNER_RULES: ScannerRule[] = [
     attackVector: 'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
     impact: 'Allows probing internal VPC services and cloud metadata endpoints from the backend server.',
     remediation: 'Validate URL protocol (https:) and enforce an explicit hostname allowlist before outbound fetch.',
-    patchLine: (line) => `${line} /* verify outbound URL host allowlist */`,
+    patchLine: (line) => line, // comment-only hint is not a functional auto-fix
   },
   {
     ruleId: 'RTA-REDIR-007',
@@ -174,11 +175,8 @@ const SCANNER_RULES: ScannerRule[] = [
     attackVector: 'https://evil.phish.example/reauth',
     impact: 'Phishing links hosted on your trusted domain silently bounce users to attacker-controlled sites.',
     remediation: 'Allow only relative paths starting with "/" (excluding "//") or strictly allowlisted hostnames.',
-    patchLine: (line) =>
-      line.replace(
-        /res\.redirect\s*\(([^)]+)\)/,
-        "res.redirect(isSafeRelativePath($1) ? $1 : '/dashboard')"
-      ),
+    // Avoid injecting undefined helper names as an auto-fix.
+    patchLine: (line) => line,
   },
   {
     ruleId: 'RTA-SECRET-008',
@@ -222,7 +220,8 @@ const SCANNER_RULES: ScannerRule[] = [
     attackVector: '{"sku":"pro-plan","clientTotal":0.01}',
     impact: 'Buyers can manipulate checkout totals to $0.01 before payment authorization.',
     remediation: 'Compute authoritative line-item pricing exclusively from server-side catalog records.',
-    patchLine: (line) => line.replace(/req\.body\.(?:price|total|clientTotal|amount)/gi, 'CATALOG[req.body.sku].price'),
+    // Avoid injecting undefined identifiers as an auto-fix.
+    patchLine: (line) => line,
   },
 ];
 
@@ -265,11 +264,22 @@ export function scanSourceCode(code: string, filePath = 'target.ts'): StaticFind
   return findings;
 }
 
+function isFunctionalPatch(original: string, patched: string): boolean {
+  if (patched === original) return false;
+  const t = patched.trim();
+  if (t.startsWith('//') || /^\/\*[\s\S]*\*\/$/.test(t)) return false;
+  if (/TODO|FIXME/i.test(patched) && /\/[/*]/.test(patched)) return false;
+  return true;
+}
+
 export function buildPatchedCodeFromFindings(code: string, findings: StaticFinding[]): string {
   const lines = code.split(/\r?\n/);
   const linePatchMap = new Map<number, string>();
   for (const f of findings) {
-    if (!linePatchMap.has(f.line)) {
+    const original = lines[f.line - 1];
+    if (original == null) continue;
+    // Prefer first functional, line-changing patch for a line; skip comment-only/non-functional patches.
+    if (!linePatchMap.has(f.line) && isFunctionalPatch(original, f.patchedLine)) {
       linePatchMap.set(f.line, f.patchedLine);
     }
   }

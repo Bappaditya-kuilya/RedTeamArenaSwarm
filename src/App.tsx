@@ -490,6 +490,53 @@ export default function App() {
   const agentCountRef = useRef(agentCount);
   agentCountRef.current = agentCount;
   const activeWorkFileRef = useRef<string>('');
+  const workspaceRef = useRef<WorkspaceSnapshot | null>(workspace);
+  workspaceRef.current = workspace;
+  const opInFlightRef = useRef({ scan: false, swarmFix: false, featureBuild: false });
+  const sseLogBufferRef = useRef<string[]>([]);
+  const sseLogFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamFlushTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const pendingStreamRef = useRef<Record<string, { content: string; filePath: string }>>({});
+
+  const flushSseLogs = useCallback(() => {
+    if (sseLogFlushTimerRef.current) {
+      clearTimeout(sseLogFlushTimerRef.current);
+      sseLogFlushTimerRef.current = null;
+    }
+    const pending = sseLogBufferRef.current;
+    if (pending.length === 0) return;
+    sseLogBufferRef.current = [];
+    setAgentOutputLogs((prev) => [...prev.slice(-(220 - Math.min(pending.length, 220))), ...pending].slice(-220));
+  }, []);
+
+  const queueSseLog = useCallback((lines: string | string[]) => {
+    const arr = Array.isArray(lines) ? lines : [lines];
+    if (arr.length === 0) return;
+    sseLogBufferRef.current.push(...arr);
+    if (sseLogFlushTimerRef.current) return;
+    sseLogFlushTimerRef.current = setTimeout(flushSseLogs, 60);
+  }, [flushSseLogs]);
+
+  const flushStreamUpdate = useCallback((filePath: string) => {
+    const timer = streamFlushTimersRef.current[filePath];
+    if (timer) {
+      clearTimeout(timer);
+      delete streamFlushTimersRef.current[filePath];
+    }
+    const pending = pendingStreamRef.current[filePath];
+    if (!pending) return;
+    delete pendingStreamRef.current[filePath];
+    setWorkspace((prev) => {
+      if (!prev) return prev;
+      return { ...prev, fileContents: { ...prev.fileContents, [pending.filePath]: pending.content } };
+    });
+  }, []);
+
+  const queueStreamUpdate = useCallback((filePath: string, content: string) => {
+    pendingStreamRef.current[filePath] = { filePath, content };
+    if (streamFlushTimersRef.current[filePath]) return;
+    streamFlushTimersRef.current[filePath] = setTimeout(() => flushStreamUpdate(filePath), 60);
+  }, [flushStreamUpdate]);
 
   const setActiveWorkFile = useCallback((filePath: string, force = false) => {
     if (!filePath) return;
@@ -500,8 +547,18 @@ export default function App() {
     setPrimaryTabs((prev) => (prev.includes(filePath) ? prev : [...prev.slice(-7), filePath]));
   }, []);
 
+  const [editorReveal, setEditorReveal] = useState<{
+    primary: { filePath: string; line: number; column: number; nonce: number } | null;
+    secondary: { filePath: string; line: number; column: number; nonce: number } | null;
+  }>({ primary: null, secondary: null });
+  const revealNonceRef = useRef(0);
+
   const openFileInPane = useCallback(
-    (filePath: string, pane: 'primary' | 'secondary' = 'primary') => {
+    (
+      filePath: string,
+      pane: 'primary' | 'secondary' = 'primary',
+      opts?: { line?: number; column?: number }
+    ) => {
       if (!filePath) return;
       if (pane === 'secondary') {
         setIsSplitOpen(true);
@@ -510,6 +567,16 @@ export default function App() {
       } else {
         setPrimaryActiveFile(filePath);
         setPrimaryTabs((prev) => (prev.includes(filePath) ? prev : [...prev.slice(-6), filePath]));
+      }
+      if (opts?.line) {
+        revealNonceRef.current += 1;
+        const target = {
+          filePath,
+          line: Math.max(1, opts.line),
+          column: Math.max(1, opts.column ?? 1),
+          nonce: revealNonceRef.current,
+        };
+        setEditorReveal((prev) => ({ ...prev, [pane]: target }));
       }
     },
     []
@@ -556,11 +623,14 @@ export default function App() {
     for (const sub of data.subagents ?? []) {
       lines.push(`[${sub.name}] ${sub.summary} (${sub.findingsCount} findings, ${sub.elapsedMs}ms)`);
     }
-    setAgentOutputLogs((prev) => [...prev.slice(-180), ...lines].slice(-220));
-  }, []);
+    flushSseLogs();
+    setAgentOutputLogs((prev) => [...prev.slice(-(220 - Math.min(lines.length, 220))), ...lines].slice(-220));
+  }, [flushSseLogs]);
 
   const runScanOnWorkspace = useCallback(
     async (ws: WorkspaceSnapshot): Promise<DebugRunResponse | null> => {
+      if (opInFlightRef.current.scan) return null;
+      opInFlightRef.current.scan = true;
       setIsDebugging(true);
       setIdeError(null);
       setCursorAgents((prev) =>
@@ -669,6 +739,7 @@ export default function App() {
         setCursorAgents(buildIdleAgents(10));
         return null;
       } finally {
+        opInFlightRef.current.scan = false;
         setIsDebugging(false);
       }
     },
@@ -676,7 +747,7 @@ export default function App() {
   );
 
   const consumeSwarmSse = useCallback(
-    async (ws: WorkspaceSnapshot, resp: Response) => {
+    async (ws: WorkspaceSnapshot, resp: Response): Promise<boolean> => {
       if (!resp.ok || !resp.body) {
         const data = await safeReadJson<{ error?: string }>(resp);
         throw new Error(
@@ -688,254 +759,251 @@ export default function App() {
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let gotAuthoritativeComplete = false;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const frames = buffer.split('\n\n');
-        buffer = frames.pop() ?? '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split('\n\n');
+          buffer = frames.pop() ?? '';
 
-        for (const frame of frames) {
-          const line = frame.split('\n').find((l) => l.startsWith('data: '));
-          if (!line) continue;
-          const rawJson = line.slice(6).trim();
-          if (!rawJson) continue;
+          for (const frame of frames) {
+            const line = frame.split('\n').find((l) => l.startsWith('data: '));
+            if (!line) continue;
+            const rawJson = line.slice(6).trim();
+            if (!rawJson) continue;
 
-          let evt: SwarmStreamEvent;
-          try {
-            evt = JSON.parse(rawJson) as SwarmStreamEvent;
-          } catch {
-            setAgentOutputLogs((prev) => [...prev.slice(-180), '[sse] dropped malformed event']);
-            continue;
-          }
-
-          if (evt.type === 'phase') {
-            setAgentOutputLogs((prev) => [...prev.slice(-180), `[${evt.phase}] ${evt.message}`]);
-          } else if (evt.type === 'composer:plan') {
-            setComposerPlan({
-              prompt: evt.prompt,
-              summary: evt.summary,
-              steps: evt.steps,
-            });
-            if (evt.steps[0]?.filePath) routeAgentFileToPane(evt.steps[0].filePath, true);
-          } else if (evt.type === 'diagnostics:ready') {
-            setDebugResult((prev) =>
-              withScanEvidence({
-                workspaceId: ws.workspaceId,
-                subagents: prev?.subagents ?? [],
-                diagnostics: evt.diagnostics,
-                tscResult: evt.tscResult,
-                testResult: evt.testResult,
-                terminalLines: prev?.terminalLines ?? [],
-                gitDiff: prev?.gitDiff ?? '',
-                fileStatuses: prev?.fileStatuses,
-                totalElapsedMs: prev?.totalElapsedMs ?? 0,
-              })
-            );
-            const first = evt.diagnostics[0]?.filePath;
-            if (first) routeAgentFileToPane(first, true);
-          } else if (evt.type === 'agent:update') {
-            setCursorAgents((prev) => {
-              const exists = prev.some((a) => a.id === evt.agent.id);
-              const nextAgent = {
-                ...evt.agent,
-                filePath:
-                  evt.agent.filePath && activeWorkFileRef.current
-                    ? activeWorkFileRef.current
-                    : evt.agent.filePath,
-              };
-              if (!exists) return [...prev, nextAgent];
-              return prev.map((a) => (a.id === evt.agent.id ? nextAgent : a));
-            });
-            if (evt.logLine) {
-              setAgentOutputLogs((prev) => [...prev.slice(-180), evt.logLine!]);
+            let evt: SwarmStreamEvent;
+            try {
+              evt = JSON.parse(rawJson) as SwarmStreamEvent;
+            } catch {
+              queueSseLog('[sse] dropped malformed event');
+              continue;
             }
-            const workFile =
-              activeWorkFileRef.current ||
-              (['navigating', 'writing', 'editing', 'scanning', 'verifying'].includes(evt.agent.status)
-                ? evt.agent.filePath
-                : null);
-            if (workFile) routeAgentFileToPane(workFile, !activeWorkFileRef.current);
-          } else if (evt.type === 'file:streaming') {
-            const filePath = activeWorkFileRef.current || evt.filePath;
-            activeWorkFileRef.current = filePath;
-            setStreamingFiles((prev) => ({ ...prev, [filePath]: true }));
-            setWorkspace((prev) => {
-              if (!prev) return prev;
-              const nextFiles = evt.files ?? prev.files;
-              return {
-                ...prev,
-                files: nextFiles,
-                fileContents: { ...prev.fileContents, [filePath]: evt.content },
-              };
-            });
-            routeAgentFileToPane(filePath, true);
-          } else if (evt.type === 'file:created') {
-            const filePath = activeWorkFileRef.current || evt.filePath;
-            activeWorkFileRef.current = filePath;
-            setStreamingFiles((prev) => ({ ...prev, [filePath]: false }));
-            setWorkspace((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    files: evt.files,
-                    fileStatuses: evt.fileStatuses,
-                    fileContents: { ...prev.fileContents, [filePath]: evt.content },
-                  }
-                : prev
-            );
-            setComposerPlan((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    steps: prev.steps.map((s) =>
-                      s.filePath === filePath ? { ...s, status: 'done' } : s
-                    ),
-                  }
-                : prev
-            );
-            setDebugResult((prev) =>
-              prev ? { ...prev, gitDiff: evt.gitDiff, fileStatuses: evt.fileStatuses } : prev
-            );
-            routeAgentFileToPane(filePath, true);
-            setAgentOutputLogs((prev) => [
-              ...prev.slice(-180),
-              `[${evt.agentName}] Created ${filePath} (real workspace write)`,
-            ]);
-          } else if (evt.type === 'file:patched') {
-            const filePath = activeWorkFileRef.current || evt.filePath;
-            activeWorkFileRef.current = filePath;
-            setStreamingFiles((prev) => ({ ...prev, [filePath]: false }));
-            setWorkspace((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    fileStatuses: evt.fileStatuses ?? prev.fileStatuses,
-                    fileContents: { ...prev.fileContents, [filePath]: evt.content },
-                  }
-                : prev
-            );
-            setComposerPlan((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    steps: prev.steps.map((s) =>
-                      s.filePath === filePath ? { ...s, status: 'done' } : s
-                    ),
-                  }
-                : prev
-            );
-            setDebugResult((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    gitDiff: evt.gitDiff,
-                    fileStatuses: evt.fileStatuses ?? prev.fileStatuses,
-                    diagnostics: prev.diagnostics.map((d) =>
-                      evt.diagnosticIds.includes(d.id)
-                        ? {
-                            ...d,
-                            attemptedFix: true,
-                            verificationStatus: 'attempted',
-                            provenance: d.provenance ?? `real:${d.source} ${d.filePath}:${d.line} [${d.code}]`,
-                          }
-                        : d
-                    ),
-                  }
-                : prev
-            );
-            routeAgentFileToPane(filePath, true);
-            setAgentOutputLogs((prev) => [
-              ...prev.slice(-180),
-              `[${evt.agentName}] Patched ${filePath}:${evt.line} (awaiting verified server result)`,
-            ]);
-          } else if (evt.type === 'file:reverted') {
-            const filePath = activeWorkFileRef.current || evt.filePath;
-            setStreamingFiles((prev) => ({ ...prev, [filePath]: false }));
-            setWorkspace((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    fileContents: { ...prev.fileContents, [filePath]: evt.content },
-                  }
-                : prev
-            );
-            setDebugResult((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    gitDiff: evt.gitDiff,
-                    diagnostics: prev.diagnostics.map((d) =>
-                      d.filePath === filePath && d.verificationStatus === 'attempted'
-                        ? {
-                            ...d,
-                            fixed: false,
-                            verified: false,
-                            verificationStatus: 'reverted',
-                            unfixableReason: evt.reason,
-                          }
-                        : d
-                    ),
-                  }
-                : prev
-            );
-            routeAgentFileToPane(filePath, true);
-            setAgentOutputLogs((prev) => [...prev.slice(-180), `[ROLLBACK] ${evt.reason}`]);
-          } else if (evt.type === 'swarm:complete') {
-            setStreamingFiles({});
-            const verified = withScanEvidence({
-              ...evt.result,
-              diagnostics: (evt.result.diagnostics ?? []).map((d) => ({
-                ...d,
-                verificationStatus: d.fixed ? 'verified' : (d.verificationStatus ?? 'open'),
-                verified: d.fixed ? true : d.verified,
-              })),
-            });
-            setDebugResult(verified);
-            setCursorAgents(
-              (evt.agents ?? []).map((a, idx) => ({
-                ...a,
-                name: a.name?.startsWith('Cursor') ? a.name : `Cursor ${idx + 1}`,
-                filePath: activeWorkFileRef.current || a.filePath,
-              }))
-            );
-            setWorkspace((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    files: evt.files ?? prev.files,
-                    fileStatuses: evt.fileStatuses ?? evt.result.fileStatuses ?? prev.fileStatuses,
-                    fileContents: evt.fileContents,
-                  }
-                : prev
-            );
-            if (verified.diagnostics[0]?.filePath) routeAgentFileToPane(verified.diagnostics[0].filePath, true);
-            logScanEvidence(verified);
-            setAgentOutputLogs((prev) => [
-              ...prev.slice(-180),
-              `[swarm:complete] verified server results: fixed=${evt.fixedCount}, created=${evt.createdCount ?? 0}, remaining=${verified.diagnostics.filter((d) => !d.fixed).length}`,
-            ]);
-            activeWorkFileRef.current = '';
-          } else if (evt.type === 'error') {
-            setIdeError(evt.message);
-            setAgentOutputLogs((prev) => [...prev.slice(-180), `[error] ${evt.message}`]);
+
+            if (evt.type === 'phase') {
+              queueSseLog(`[${evt.phase}] ${evt.message}`);
+            } else if (evt.type === 'composer:plan') {
+              setComposerPlan({
+                prompt: evt.prompt,
+                summary: evt.summary,
+                steps: evt.steps,
+              });
+              if (evt.steps[0]?.filePath) routeAgentFileToPane(evt.steps[0].filePath, true);
+            } else if (evt.type === 'diagnostics:ready') {
+              setDebugResult((prev) =>
+                withScanEvidence({
+                  workspaceId: ws.workspaceId,
+                  subagents: prev?.subagents ?? [],
+                  diagnostics: evt.diagnostics,
+                  tscResult: evt.tscResult,
+                  testResult: evt.testResult,
+                  terminalLines: prev?.terminalLines ?? [],
+                  gitDiff: prev?.gitDiff ?? '',
+                  fileStatuses: prev?.fileStatuses,
+                  totalElapsedMs: prev?.totalElapsedMs ?? 0,
+                })
+              );
+              const first = evt.diagnostics[0]?.filePath;
+              if (first) routeAgentFileToPane(first, true);
+            } else if (evt.type === 'agent:update') {
+              setCursorAgents((prev) => {
+                const exists = prev.some((a) => a.id === evt.agent.id);
+                const nextAgent = {
+                  ...evt.agent,
+                  filePath:
+                    evt.agent.filePath && activeWorkFileRef.current
+                      ? activeWorkFileRef.current
+                      : evt.agent.filePath,
+                };
+                if (!exists) return [...prev, nextAgent];
+                return prev.map((a) => (a.id === evt.agent.id ? nextAgent : a));
+              });
+              if (evt.logLine) queueSseLog(evt.logLine);
+              const workFile =
+                activeWorkFileRef.current ||
+                (['navigating', 'writing', 'editing', 'scanning', 'verifying'].includes(evt.agent.status)
+                  ? evt.agent.filePath
+                  : null);
+              if (workFile) routeAgentFileToPane(workFile, !activeWorkFileRef.current);
+            } else if (evt.type === 'file:streaming') {
+              const filePath = activeWorkFileRef.current || evt.filePath;
+              activeWorkFileRef.current = filePath;
+              setStreamingFiles((prev) => (prev[filePath] ? prev : { ...prev, [filePath]: true }));
+              queueStreamUpdate(filePath, evt.content);
+              routeAgentFileToPane(filePath, true);
+            } else if (evt.type === 'file:created') {
+              const filePath = activeWorkFileRef.current || evt.filePath;
+              activeWorkFileRef.current = filePath;
+              flushStreamUpdate(filePath);
+              setStreamingFiles((prev) => ({ ...prev, [filePath]: false }));
+              setWorkspace((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      files: evt.files,
+                      fileStatuses: evt.fileStatuses,
+                      fileContents: { ...prev.fileContents, [filePath]: evt.content },
+                    }
+                  : prev
+              );
+              setComposerPlan((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      steps: prev.steps.map((s) =>
+                        s.filePath === filePath ? { ...s, status: 'done' } : s
+                      ),
+                    }
+                  : prev
+              );
+              setDebugResult((prev) =>
+                prev ? { ...prev, gitDiff: evt.gitDiff, fileStatuses: evt.fileStatuses } : prev
+              );
+              routeAgentFileToPane(filePath, true);
+              queueSseLog(`[${evt.agentName}] Created ${filePath} (real workspace write)`);
+            } else if (evt.type === 'file:patched') {
+              const filePath = activeWorkFileRef.current || evt.filePath;
+              activeWorkFileRef.current = filePath;
+              flushStreamUpdate(filePath);
+              setStreamingFiles((prev) => ({ ...prev, [filePath]: false }));
+              setWorkspace((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      fileStatuses: evt.fileStatuses ?? prev.fileStatuses,
+                      fileContents: { ...prev.fileContents, [filePath]: evt.content },
+                    }
+                  : prev
+              );
+              setComposerPlan((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      steps: prev.steps.map((s) =>
+                        s.filePath === filePath ? { ...s, status: 'done' } : s
+                      ),
+                    }
+                  : prev
+              );
+              setDebugResult((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      gitDiff: evt.gitDiff,
+                      fileStatuses: evt.fileStatuses ?? prev.fileStatuses,
+                      diagnostics: prev.diagnostics.map((d) =>
+                        evt.diagnosticIds.includes(d.id)
+                          ? {
+                              ...d,
+                              attemptedFix: true,
+                              verificationStatus: 'attempted',
+                              provenance: d.provenance ?? `real:${d.source} ${d.filePath}:${d.line} [${d.code}]`,
+                            }
+                          : d
+                      ),
+                    }
+                  : prev
+              );
+              routeAgentFileToPane(filePath, true);
+              queueSseLog(`[${evt.agentName}] Patched ${filePath}:${evt.line} (awaiting verified server result)`);
+            } else if (evt.type === 'file:reverted') {
+              const filePath = activeWorkFileRef.current || evt.filePath;
+              flushStreamUpdate(filePath);
+              setStreamingFiles((prev) => ({ ...prev, [filePath]: false }));
+              setWorkspace((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      fileContents: { ...prev.fileContents, [filePath]: evt.content },
+                    }
+                  : prev
+              );
+              setDebugResult((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      gitDiff: evt.gitDiff,
+                      diagnostics: prev.diagnostics.map((d) =>
+                        d.filePath === filePath && d.verificationStatus === 'attempted'
+                          ? {
+                              ...d,
+                              fixed: false,
+                              verified: false,
+                              verificationStatus: 'reverted',
+                              unfixableReason: evt.reason,
+                            }
+                          : d
+                      ),
+                    }
+                  : prev
+              );
+              routeAgentFileToPane(filePath, true);
+              queueSseLog(`[ROLLBACK] ${evt.reason}`);
+            } else if (evt.type === 'swarm:complete') {
+              for (const p of Object.keys(pendingStreamRef.current)) flushStreamUpdate(p);
+              setStreamingFiles({});
+              const verified = withScanEvidence({
+                ...evt.result,
+                diagnostics: (evt.result.diagnostics ?? []).map((d) => ({
+                  ...d,
+                  verificationStatus: d.fixed ? 'verified' : (d.verificationStatus ?? 'open'),
+                  verified: d.fixed ? true : d.verified,
+                })),
+              });
+              setDebugResult(verified);
+              setCursorAgents(
+                (evt.agents ?? []).map((a, idx) => ({
+                  ...a,
+                  name: a.name?.startsWith('Cursor') ? a.name : `Cursor ${idx + 1}`,
+                  filePath: activeWorkFileRef.current || a.filePath,
+                }))
+              );
+              setWorkspace((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      files: evt.files ?? prev.files,
+                      fileStatuses: evt.fileStatuses ?? evt.result.fileStatuses ?? prev.fileStatuses,
+                      fileContents: evt.fileContents,
+                    }
+                  : prev
+              );
+              if (verified.diagnostics[0]?.filePath) routeAgentFileToPane(verified.diagnostics[0].filePath, true);
+              logScanEvidence(verified);
+              queueSseLog(
+                `[swarm:complete] verified server results: fixed=${evt.fixedCount}, created=${evt.createdCount ?? 0}, remaining=${verified.diagnostics.filter((d) => !d.fixed).length}`
+              );
+              activeWorkFileRef.current = '';
+              gotAuthoritativeComplete = true;
+            } else if (evt.type === 'error') {
+              setIdeError(evt.message);
+              queueSseLog(`[error] ${evt.message}`);
+            }
           }
         }
+      } finally {
+        flushSseLogs();
       }
+      return gotAuthoritativeComplete;
     },
-    [logScanEvidence, routeAgentFileToPane]
+    [flushSseLogs, flushStreamUpdate, logScanEvidence, queueSseLog, queueStreamUpdate, routeAgentFileToPane]
   );
 
   const runSwarmFixOnWorkspace = useCallback(
     async (ws: WorkspaceSnapshot, _count: number, speed: CursorSpeed) => {
+      if (opInFlightRef.current.swarmFix || opInFlightRef.current.featureBuild) return;
+      opInFlightRef.current.swarmFix = true;
       const fixedCount = 10;
       setIsSwarmFixing(true);
       setIdeError(null);
       setIsSplitOpen(false);
-      activeWorkFileRef.current = (debugResult?.diagnostics ?? []).find((d) => !d.fixed)?.filePath ?? ws.files[0]?.path ?? '';
+      const baseWs = workspaceRef.current ?? ws;
+      activeWorkFileRef.current = (debugResult?.diagnostics ?? []).find((d) => !d.fixed)?.filePath ?? baseWs.files[0]?.path ?? '';
       setCursorAgents(buildIdleAgents(fixedCount));
-      setAgentOutputLogs([`$ swarm fix --cursors=${fixedCount} --speed=${speed} (${ws.repoName})`]);
+      setAgentOutputLogs([`$ swarm fix --cursors=${fixedCount} --speed=${speed} (${baseWs.repoName})`]);
 
       const runShowcaseFix = async () => {
         const mult = speed === 'fast' ? 0.25 : speed === 'normal' ? 0.55 : 1;
@@ -1024,29 +1092,34 @@ export default function App() {
       };
 
       try {
-        if (isShowcaseWs(ws)) {
+        const curWs = workspaceRef.current ?? ws;
+        if (isShowcaseWs(curWs)) {
           await runShowcaseFix();
         } else {
-          const resp = await fetch(apiUrl(`/api/repo/${ws.workspaceId}/swarm-fix`), {
+          const resp = await fetch(apiUrl(`/api/repo/${curWs.workspaceId}/swarm-fix`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ agentCount: fixedCount, speed, useAi: true }),
           });
           if (!resp.ok || !resp.body) {
-            if (isShowcaseWs(ws)) await runShowcaseFix();
-            else throw new Error((await safeReadJson<{error?:string}>(resp))?.error || 'Swarm stream failed.');
+            throw new Error((await safeReadJson<{ error?: string }>(resp))?.error || 'Swarm stream failed.');
           } else {
-            await consumeSwarmSse(ws, resp);
-            await runScanOnWorkspace(ws);
+            const authoritative = await consumeSwarmSse(curWs, resp);
+            if (!authoritative) {
+              const latest = workspaceRef.current;
+              if (latest) await runScanOnWorkspace(latest);
+            }
           }
         }
       } catch (err) {
-        if (isShowcaseWs(ws)) {
+        const curWs = workspaceRef.current ?? ws;
+        if (isShowcaseWs(curWs)) {
           try { await runShowcaseFix(); } catch (e) { setIdeError(e instanceof Error ? e.message : 'Swarm execution failed.'); }
         } else {
           setIdeError(err instanceof Error ? err.message : 'Swarm execution failed.');
         }
       } finally {
+        opInFlightRef.current.swarmFix = false;
         setIsSwarmFixing(false);
         setStreamingFiles({});
         activeWorkFileRef.current = '';
@@ -1058,12 +1131,15 @@ export default function App() {
 
   const runFeatureBuildOnWorkspace = useCallback(
     async (ws: WorkspaceSnapshot, prompt: string, _count: number, speed: CursorSpeed) => {
+      if (opInFlightRef.current.featureBuild || opInFlightRef.current.swarmFix) return;
+      opInFlightRef.current.featureBuild = true;
       const fixedCount = 10;
       setIsBuildingFeature(true);
       setIdeError(null);
       setComposerPlan(null);
       setIsSplitOpen(false);
       activeWorkFileRef.current = '';
+      const baseWs = workspaceRef.current ?? ws;
       setCursorAgents(buildIdleAgents(fixedCount));
       setAgentOutputLogs((prev) => [
         ...prev.slice(-180),
@@ -1127,29 +1203,34 @@ export default function App() {
       };
 
       try {
-        if (isShowcaseWs(ws)) {
+        const curWs = workspaceRef.current ?? ws;
+        if (isShowcaseWs(curWs)) {
           await runShowcaseBuild();
         } else {
-          const resp = await fetch(apiUrl(`/api/repo/${ws.workspaceId}/composer`), {
+          const resp = await fetch(apiUrl(`/api/repo/${curWs.workspaceId}/composer`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ prompt, agentCount: fixedCount, speed, useAi: true }),
           });
           if (!resp.ok || !resp.body) {
-            if (isShowcaseWs(ws)) await runShowcaseBuild();
-            else throw new Error((await safeReadJson<{error?:string}>(resp))?.error || 'Feature build failed.');
+            throw new Error((await safeReadJson<{ error?: string }>(resp))?.error || 'Feature build failed.');
           } else {
-            await consumeSwarmSse(ws, resp);
-            await runScanOnWorkspace(ws);
+            const authoritative = await consumeSwarmSse(curWs, resp);
+            if (!authoritative) {
+              const latest = workspaceRef.current;
+              if (latest) await runScanOnWorkspace(latest);
+            }
           }
         }
       } catch (err) {
-        if (isShowcaseWs(ws)) {
+        const curWs = workspaceRef.current ?? ws;
+        if (isShowcaseWs(curWs)) {
           try { await runShowcaseBuild(); } catch (e) { setIdeError(e instanceof Error ? e.message : 'Feature build failed.'); }
         } else {
           setIdeError(err instanceof Error ? err.message : 'Feature build failed.');
         }
       } finally {
+        opInFlightRef.current.featureBuild = false;
         setIsBuildingFeature(false);
         setStreamingFiles({});
         activeWorkFileRef.current = '';
@@ -1636,11 +1717,13 @@ export default function App() {
       autoFollowAgent={autoFollowAgent}
       agentCount={agentCount}
       cursorSpeed={cursorSpeed}
+      primaryReveal={editorReveal.primary}
+      secondaryReveal={editorReveal.secondary}
       onChangeAgentCount={() => {}}
       onChangeCursorSpeed={setCursorSpeed}
       onToggleAutoFollow={() => setAutoFollowAgent((p) => !p)}
       onFocusPane={setFocusedPane}
-      onSelectFile={(fp, pane) => openFileInPane(fp, pane ?? focusedPane)}
+      onSelectFile={(fp, pane, opts) => openFileInPane(fp, pane ?? focusedPane, opts)}
       onCloseTab={closeTabInPane}
       onToggleSplit={() => {
         setIsSplitOpen((prev) => {

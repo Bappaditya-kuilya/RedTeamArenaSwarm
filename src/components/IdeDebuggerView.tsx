@@ -71,11 +71,17 @@ interface IdeDebuggerViewProps {
   autoFollowAgent: boolean;
   agentCount: number;
   cursorSpeed: CursorSpeed;
+  primaryReveal?: { filePath: string; line: number; column: number; nonce: number } | null;
+  secondaryReveal?: { filePath: string; line: number; column: number; nonce: number } | null;
   onChangeAgentCount: (count: number) => void;
   onChangeCursorSpeed: (speed: CursorSpeed) => void;
   onToggleAutoFollow: () => void;
   onFocusPane: (pane: 'primary' | 'secondary') => void;
-  onSelectFile: (filePath: string, pane?: 'primary' | 'secondary') => void;
+  onSelectFile: (
+    filePath: string,
+    pane?: 'primary' | 'secondary',
+    opts?: { line?: number; column?: number }
+  ) => void;
   onCloseTab: (filePath: string, pane: 'primary' | 'secondary') => void;
   onToggleSplit: () => void;
   onCloseSecondaryPane: () => void;
@@ -132,6 +138,8 @@ export function IdeDebuggerView({
   autoFollowAgent,
   agentCount,
   cursorSpeed,
+  primaryReveal,
+  secondaryReveal,
   onChangeAgentCount,
   onChangeCursorSpeed,
   onToggleAutoFollow,
@@ -252,7 +260,7 @@ export function IdeDebuggerView({
 
   const handleJumpToDiagnostic = (diag: CodeDiagnostic) => {
     setSelectedDiagId(diag.id);
-    onSelectFile(diag.filePath, focusedPane);
+    onSelectFile(diag.filePath, focusedPane, { line: diag.line, column: diag.column });
   };
 
   const handleUploadFiles = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -686,14 +694,14 @@ export function IdeDebuggerView({
                   ) : (
                     searchMatches.map((m, idx) => (
                       <button
-                        key={`${m.filePath}-${m.line}-${idx}`}
+                        key={`${m.filePath}-${m.line}-${m.column}-${idx}`}
                         type="button"
-                        onClick={() => onSelectFile(m.filePath, focusedPane)}
-                        className="w-full px-3 py-1.5 text-left hover:bg-[#2a2d2e] space-y-0.5 border-b border-[#2b2b2b]"
+                        onClick={() => onSelectFile(m.filePath, focusedPane, { line: m.line, column: m.column })}
+                        className="w-full px-3 py-1.5 text-left hover:bg-[#2a2d2e] focus:bg-[#094771]/30 focus:outline-none space-y-0.5 border-b border-[#2b2b2b]"
                       >
                         <div className="flex items-center justify-between text-[12px] font-mono text-[#3794ff]">
                           <span className="truncate">{m.filePath}</span>
-                          <span className="text-[#969696] shrink-0">:{m.line}</span>
+                          <span className="text-[#969696] shrink-0">:{m.line}:{m.column}</span>
                         </div>
                         <div className="text-[12px] font-mono text-[#cccccc] truncate">
                           {m.lineText.trim()}
@@ -934,6 +942,7 @@ export function IdeDebuggerView({
               cursorAgents={cursorAgents}
               streamingFiles={streamingFiles}
               selectedDiagId={selectedDiagId}
+              revealTarget={primaryReveal}
               onFocusPane={() => onFocusPane('primary')}
               onSelectFile={(fp) => onSelectFile(fp, 'primary')}
               onCloseTab={(fp) => onCloseTab(fp, 'primary')}
@@ -959,6 +968,7 @@ export function IdeDebuggerView({
                 cursorAgents={cursorAgents}
                 streamingFiles={streamingFiles}
                 selectedDiagId={selectedDiagId}
+                revealTarget={secondaryReveal}
                 onFocusPane={() => onFocusPane('secondary')}
                 onSelectFile={(fp) => onSelectFile(fp, 'secondary')}
                 onCloseTab={(fp) => onCloseTab(fp, 'secondary')}
@@ -1230,7 +1240,6 @@ export function IdeDebuggerView({
           <button
             type="button"
             onClick={() => {
-              setBottomOpen(true);
               setBottomOpen(true);
               setBottomTab('diff');
               setSidebarMode('scm');

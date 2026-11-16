@@ -6,6 +6,28 @@ import { promisify } from 'node:util';
 import type { RepoFileNode, WorkspaceSnapshot } from '../src/types/ide';
 
 const execFileAsync = promisify(execFile);
+const GITHUB_FETCH_TIMEOUT_MS = 15_000;
+
+async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = GITHUB_FETCH_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function describeGitHubHttpError(status: number, context: string): string {
+  if (status === 403) return `${context}: GitHub API rate limit or access forbidden (HTTP 403).`;
+  if (status === 429) return `${context}: GitHub API rate limited (HTTP 429). Retry later.`;
+  return `${context}: GitHub returned HTTP ${status}.`;
+}
 
 const WORKSPACES_ROOT = '/tmp/swarm-workspaces';
 
@@ -148,20 +170,64 @@ export function parseGitHubInput(rawInput: string): {
 }
 
 async function ensureGitBaseline(dir: string): Promise<string> {
+  const execGit = (args: string[]) =>
+    execFileAsync('git', args, { cwd: dir, timeout: 5000 });
+
+  let hasGitDir = false;
   try {
     await fs.access(path.join(dir, '.git'));
-    const { stdout } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
-      cwd: dir,
-      timeout: 5000,
-    });
-    return stdout.trim() || 'main';
+    hasGitDir = true;
   } catch {
-    await execFileAsync('git', ['init'], { cwd: dir, timeout: 5000 });
-    await execFileAsync('git', ['config', 'user.email', 'swarm@local'], { cwd: dir, timeout: 5000 });
-    await execFileAsync('git', ['config', 'user.name', 'Swarm IDE'], { cwd: dir, timeout: 5000 });
-    await execFileAsync('git', ['add', '-A'], { cwd: dir, timeout: 5000 });
-    await execFileAsync('git', ['commit', '-m', 'Initial baseline'], { cwd: dir, timeout: 5000 });
+    hasGitDir = false;
+  }
+
+  if (hasGitDir) {
+    try {
+      const { stdout } = await execGit(['rev-parse', '--abbrev-ref', 'HEAD']);
+      const branch = stdout.trim();
+      if (branch && branch !== 'HEAD') return branch;
+      // Unborn HEAD or detached/unresolved: try to discover a branch name.
+      try {
+        const { stdout: sym } = await execGit(['symbolic-ref', '--short', 'HEAD']);
+        const symBranch = sym.trim();
+        if (symBranch) return symBranch;
+      } catch {
+        // ignore
+      }
+      return 'main';
+    } catch {
+      // Existing .git but HEAD unreadable; fall through to initialize baseline.
+    }
+  }
+
+  try {
+    await execGit(['init']);
+    await execGit(['config', 'user.email', 'swarm@local']);
+    await execGit(['config', 'user.name', 'Swarm IDE']);
+    await execGit(['add', '-A']);
+    try {
+      await execGit(['commit', '-m', 'Initial baseline', '--allow-empty']);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // "nothing to commit" / existing baseline cases are non-fatal for baseline setup.
+      if (!/nothing to commit|nothing added to commit|already exists|previous cherry-pick/i.test(msg)) {
+        // If commit failed for another reason but repo is initialized, continue with resolved branch.
+      }
+    }
+    try {
+      const { stdout } = await execGit(['rev-parse', '--abbrev-ref', 'HEAD']);
+      const branch = stdout.trim();
+      if (branch && branch !== 'HEAD') return branch;
+    } catch {
+      // Unborn HEAD after init (e.g. empty commit disallowed in some envs) is acceptable.
+    }
     return 'main';
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/not found|ENOENT|spawn git/i.test(msg)) {
+      throw new Error(`Git is required but unavailable in this environment: ${msg}`);
+    }
+    throw new Error(`Failed to initialize workspace git baseline: ${msg}`);
   }
 }
 
@@ -328,23 +394,22 @@ async function fetchViaGitHubRestFallback(
   targetDir: string,
   preferredBranch?: string
 ): Promise<{ branch: string; importMeta: WorkspaceImportMeta }> {
-  const repoResp = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
-    headers: { 'User-Agent': 'swarm-ide-debugger', Accept: 'application/vnd.github+json' },
+  const ghHeaders = { 'User-Agent': 'swarm-ide-debugger', Accept: 'application/vnd.github+json' };
+  const repoResp = await fetchWithTimeout(`https://api.github.com/repos/${owner}/${repo}`, {
+    headers: ghHeaders,
   });
   if (!repoResp.ok) {
-    throw new Error(`GitHub returned HTTP ${repoResp.status} for ${owner}/${repo}.`);
+    throw new Error(describeGitHubHttpError(repoResp.status, `Failed to read repository metadata for ${owner}/${repo}`));
   }
   const repoJson = (await repoResp.json()) as { default_branch?: string };
   const branch = preferredBranch || repoJson.default_branch || 'main';
 
-  const treeResp = await fetch(
+  const treeResp = await fetchWithTimeout(
     `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`,
-    {
-      headers: { 'User-Agent': 'swarm-ide-debugger', Accept: 'application/vnd.github+json' },
-    }
+    { headers: ghHeaders }
   );
   if (!treeResp.ok) {
-    throw new Error(`Unable to read GitHub file tree (${treeResp.status}).`);
+    throw new Error(describeGitHubHttpError(treeResp.status, `Unable to read GitHub file tree for ${owner}/${repo}@${branch}`));
   }
   const treeJson = (await treeResp.json()) as {
     tree?: Array<{ path: string; type: string; size?: number }>;
@@ -367,25 +432,36 @@ async function fetchViaGitHubRestFallback(
     .slice(0, 240);
 
   let filesFetched = 0;
+  let rateLimited = false;
+  let forbidden = false;
   for (let i = 0; i < candidates.length; i += 20) {
     const batch = candidates.slice(i, i + 20);
     const results = await Promise.all(
       batch.map(async (item) => {
         const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${encodeURIComponent(branch)}/${item.path}`;
-        const res = await fetch(rawUrl);
-        if (!res.ok) return false;
-        const text = await res.text();
-        const dest = path.resolve(targetDir, item.path);
-        if (!dest.startsWith(targetDir + path.sep)) return false;
-        await fs.mkdir(path.dirname(dest), { recursive: true });
-        await fs.writeFile(dest, text, 'utf-8');
-        return true;
+        try {
+          const res = await fetchWithTimeout(rawUrl, {}, GITHUB_FETCH_TIMEOUT_MS);
+          if (res.status === 429) { rateLimited = true; return false; }
+          if (res.status === 403) { forbidden = true; return false; }
+          if (!res.ok) return false;
+          const text = await res.text();
+          const dest = resolveSafeFilePath(targetDir, item.path);
+          await fs.mkdir(path.dirname(dest), { recursive: true });
+          await fs.writeFile(dest, text, 'utf-8');
+          return true;
+        } catch {
+          return false;
+        }
       })
     );
     filesFetched += results.filter(Boolean).length;
   }
 
   const baselineBranch = await ensureGitBaseline(targetDir);
+  const warnings = [
+    rateLimited ? 'rate limited (HTTP 429) while fetching some files' : null,
+    forbidden ? 'access forbidden (HTTP 403) while fetching some files' : null,
+  ].filter(Boolean);
   return {
     branch: baselineBranch,
     importMeta: {
@@ -393,7 +469,7 @@ async function fetchViaGitHubRestFallback(
       partial: true,
       filesFetched,
       filesCapped: filtered.length > candidates.length,
-      note: `REST fallback import (no git history); fetched ${filesFetched}/${candidates.length} selected text files${filtered.length > candidates.length ? `, capped from ${filtered.length}` : ''}.`,
+      note: `REST fallback import (no git history); fetched ${filesFetched}/${candidates.length} selected text files${filtered.length > candidates.length ? `, capped from ${filtered.length}` : ''}${warnings.length ? `. ${warnings.join('; ')}` : ''}.`,
     },
   };
 }
@@ -424,9 +500,14 @@ export async function importGitHubWorkspace(rawUrl: string): Promise<WorkspaceSn
   } catch {
     await fs.rm(targetDir, { recursive: true, force: true });
     await fs.mkdir(targetDir, { recursive: true });
-    const fallback = await fetchViaGitHubRestFallback(parsed.owner, parsed.repo, targetDir, parsed.branch);
-    branch = fallback.branch;
-    importMeta = fallback.importMeta;
+    try {
+      const fallback = await fetchViaGitHubRestFallback(parsed.owner, parsed.repo, targetDir, parsed.branch);
+      branch = fallback.branch;
+      importMeta = fallback.importMeta;
+    } catch (fallbackErr) {
+      await fs.rm(targetDir, { recursive: true, force: true }).catch(() => {});
+      throw fallbackErr;
+    }
   }
 
   const dependencyInstall = await bootstrapDependenciesIfNeeded(targetDir);
@@ -684,9 +765,24 @@ export async function importBuggyDemoWorkspace(): Promise<WorkspaceSnapshot & { 
 }
 
 export function resolveSafeFilePath(workspaceDir: string, relPath: string): string {
-  const resolved = path.resolve(workspaceDir, relPath.replace(/^\/+/, ''));
-  if (resolved !== workspaceDir && !resolved.startsWith(workspaceDir + path.sep)) {
-    throw new Error('Blocked unsafe workspace file path.');
+  if (typeof relPath !== 'string') {
+    throw new Error('Invalid workspace file path: expected a string.');
+  }
+  if (relPath.includes('\0')) {
+    throw new Error('Invalid workspace file path: null bytes are not allowed.');
+  }
+  const cleaned = relPath.replace(/^\/+/, '').trim();
+  if (!cleaned || cleaned === '.' || cleaned === '..') {
+    throw new Error('Invalid workspace file path: path must not be empty.');
+  }
+  const segments = cleaned.split(/[\\/]+/);
+  if (segments.some((seg) => seg === '..' || seg === '')) {
+    throw new Error(`Blocked unsafe workspace file path (traversal): ${relPath}`);
+  }
+  const resolved = path.resolve(workspaceDir, cleaned);
+  const base = path.resolve(workspaceDir);
+  if (resolved === base || !(resolved === base || resolved.startsWith(base + path.sep))) {
+    throw new Error(`Blocked unsafe workspace file path: ${relPath}`);
   }
   return resolved;
 }
@@ -696,6 +792,9 @@ export async function writeWorkspaceFile(
   relPath: string,
   content: string
 ): Promise<void> {
+  if (typeof content !== 'string') {
+    throw new Error(`Invalid file content for ${relPath}: expected UTF-8 string.`);
+  }
   const fullPath = resolveSafeFilePath(workspaceDir, relPath);
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
   await fs.writeFile(fullPath, content, 'utf-8');
@@ -747,14 +846,39 @@ export async function computeWorkspaceGitDiff(workspaceDir: string): Promise<str
 }
 
 export async function revertWorkspaceChanges(workspaceDir: string): Promise<void> {
-  await execFileAsync('git', ['reset', '--hard', 'HEAD'], {
-    cwd: workspaceDir,
-    timeout: 5000,
-  });
-  await execFileAsync('git', ['clean', '-fd'], {
-    cwd: workspaceDir,
-    timeout: 5000,
-  });
+  try {
+    await fs.access(path.join(workspaceDir, '.git'));
+  } catch {
+    throw new Error('Cannot reset workspace: git repository not found.');
+  }
+  try {
+    await execFileAsync('git', ['reset', '--hard', 'HEAD'], {
+      cwd: workspaceDir,
+      timeout: 5000,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Unborn HEAD / no commits yet: treat as already-clean baseline when possible.
+    if (/unknown revision|ambiguous argument 'HEAD'|needed a single revision|does not have any commits yet/i.test(msg)) {
+      // best effort: still clean untracked files below
+    } else if (/not found|ENOENT|spawn git/i.test(msg)) {
+      throw new Error(`Cannot reset workspace: git is unavailable (${msg}).`);
+    } else {
+      throw new Error(`Failed to reset workspace to HEAD: ${msg}`);
+    }
+  }
+  try {
+    await execFileAsync('git', ['clean', '-fd'], {
+      cwd: workspaceDir,
+      timeout: 5000,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/not found|ENOENT|spawn git/i.test(msg)) {
+      throw new Error(`Cannot clean workspace: git is unavailable (${msg}).`);
+    }
+    throw new Error(`Failed to clean workspace: ${msg}`);
+  }
 }
 
 export async function runSafeWorkspaceCommand(

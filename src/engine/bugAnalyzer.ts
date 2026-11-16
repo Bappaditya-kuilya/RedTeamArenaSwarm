@@ -158,14 +158,32 @@ export function analyzeBugsInCode(
   return diagnostics;
 }
 
+function isCommentOnlyPatch(patch: string): boolean {
+  const t = patch.trim();
+  return (
+    t.startsWith('//') ||
+    /^\/\*[\s\S]*\*\/$/.test(t)
+  );
+}
+
+function isAutoApplicableSuggestedPatch(patch: string | undefined): patch is string {
+  if (!patch) return false;
+  if (patch.includes('\n')) return false;
+  if (isCommentOnlyPatch(patch)) return false;
+  if (/TODO|FIXME|hardened|verify outbound URL host allowlist/i.test(patch) && /\/[/*]/.test(patch)) {
+    return false;
+  }
+  return true;
+}
+
 export function applyDiagnosticFixToContent(
   content: string,
   diagnostic: CodeDiagnostic
 ): string {
   if (diagnostic.suggestedFilePatch) {
-    return diagnostic.suggestedFilePatch;
+    return diagnostic.suggestedFilePatch !== content ? diagnostic.suggestedFilePatch : content;
   }
-  if (!diagnostic.suggestedLinePatch) {
+  if (!isAutoApplicableSuggestedPatch(diagnostic.suggestedLinePatch)) {
     return content;
   }
 
@@ -175,15 +193,22 @@ export function applyDiagnosticFixToContent(
     return content;
   }
 
+  if (diagnostic.originalLine != null && lines[idx] !== diagnostic.originalLine) {
+    return content;
+  }
+
   const rule = BUG_RULES.find((r) => r.code === diagnostic.code);
   if (rule) {
     const composed = rule.fixLine(lines[idx], lines[idx - 1]);
-    if (composed && composed !== lines[idx]) {
+    if (composed && composed !== lines[idx] && isAutoApplicableSuggestedPatch(composed)) {
       lines[idx] = composed;
       return lines.join('\n');
     }
   }
 
+  if (diagnostic.suggestedLinePatch === lines[idx]) {
+    return content;
+  }
   lines[idx] = diagnostic.suggestedLinePatch;
   return lines.join('\n');
 }
@@ -195,7 +220,8 @@ export function applyAllFixesToFiles(
   const updatedFiles: Record<string, string> = { ...fileContents };
   const appliedIds = new Set<string>();
 
-  // Group single-line fixes per file in descending line order to keep line numbers stable
+  // Group fixes per file; apply line fixes in descending order. If a line changes, skip other
+  // diagnostics targeting the same original line snapshot (originalLine check prevents stale applies).
   const byFile = new Map<string, CodeDiagnostic[]>();
   for (const diag of diagnostics) {
     if (diag.fixed) continue;
@@ -209,7 +235,9 @@ export function applyAllFixesToFiles(
     let content = updatedFiles[filePath];
     if (content === undefined) continue;
 
-    const fullFileDiag = list.find((d) => Boolean(d.suggestedFilePatch));
+    const fullFileDiag = list.find(
+      (d) => d.suggestedFilePatch && d.suggestedFilePatch !== content
+    );
     if (fullFileDiag?.suggestedFilePatch) {
       updatedFiles[filePath] = fullFileDiag.suggestedFilePatch;
       // Only mark the diagnostic whose patch was actually applied; others may not be covered.
@@ -217,12 +245,16 @@ export function applyAllFixesToFiles(
       continue;
     }
 
-    const sorted = [...list].sort((a, b) => b.line - a.line);
+    const sorted = [...list].sort((a, b) => b.line - a.line || a.id.localeCompare(b.id));
+    const changedLines = new Set<number>();
     for (const diag of sorted) {
+      // Avoid compounding multiple patches on the same physical line in one pass.
+      if (changedLines.has(diag.line)) continue;
       const next = applyDiagnosticFixToContent(content, diag);
       if (next !== content) {
         content = next;
         appliedIds.add(diag.id);
+        changedLines.add(diag.line);
       }
     }
     updatedFiles[filePath] = content;

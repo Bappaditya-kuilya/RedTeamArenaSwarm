@@ -303,9 +303,15 @@ export async function runAutonomousFeatureBuild(params: {
   agentCount?: number;
   speed?: CursorSpeed;
   useAi?: boolean;
+  isCancelled?: () => boolean;
   emit: (event: SwarmStreamEvent) => void;
 }): Promise<void> {
-  const { workspaceId, workspaceDir, prompt, useAi = true, speed = 'slow', emit } = params;
+  const { workspaceId, workspaceDir, prompt, useAi = true, speed = 'slow', emit, isCancelled } = params;
+  const cancelled = () => Boolean(isCancelled?.());
+  const delay = async (ms: number) => {
+    if (cancelled()) return;
+    await sleep(ms);
+  };
   const mult = SPEED_MULTIPLIER[speed] ?? 1.0;
   const numAgents = 10;
 
@@ -333,9 +339,12 @@ export async function runAutonomousFeatureBuild(params: {
     message: `${numAgents} cursors converging on a one-file plan for: "${prompt.trim()}"…`,
   });
 
+  if (cancelled()) return;
   const beforeFiles = await readAllTextFiles(workspaceDir);
+  if (cancelled()) return;
   const ai = useAi ? getGeminiClient() : null;
   let plan = ai ? await synthesizePlanWithGemini(ai, prompt, beforeFiles.fileContents) : null;
+  if (cancelled()) return;
   if (!plan) {
     plan = buildFallbackFeaturePlan(prompt, beforeFiles.fileContents);
   }
@@ -377,6 +386,7 @@ export async function runAutonomousFeatureBuild(params: {
   let modifiedCount = 0;
 
   for (let tIdx = 0; tIdx < activeTasks.length; tIdx++) {
+    if (cancelled()) return;
     const task = activeTasks[tIdx];
     const leadAgent = agents[0];
 
@@ -398,12 +408,14 @@ export async function runAutonomousFeatureBuild(params: {
             : undefined,
       });
     }
-    await sleep(Math.round(620 * mult));
+    await delay(Math.round(620 * mult));
+    if (cancelled()) return;
 
     const allLines = task.content.split(/\r?\n/);
     const chunkSteps = Math.min(14, Math.max(5, Math.ceil(allLines.length / 3)));
 
     for (let step = 1; step <= chunkSteps; step++) {
+      if (cancelled()) return;
       const endLine = Math.min(
         allLines.length,
         Math.ceil((allLines.length * step) / chunkSteps)
@@ -428,7 +440,9 @@ export async function runAutonomousFeatureBuild(params: {
       }
 
       await writeWorkspaceFile(workspaceDir, task.filePath, partialContent);
+      if (cancelled()) return;
       const midFiles = step === 1 ? (await readAllTextFiles(workspaceDir)).files : undefined;
+      if (cancelled()) return;
 
       emit({ type: 'agent:update', agent: { ...leadAgent } });
       emit({
@@ -443,13 +457,17 @@ export async function runAutonomousFeatureBuild(params: {
         action: task.action,
         files: midFiles,
       });
-      await sleep(Math.round(380 * mult));
+      await delay(Math.round(380 * mult));
     }
 
+    if (cancelled()) return;
     await writeWorkspaceFile(workspaceDir, task.filePath, task.content);
+    if (cancelled()) return;
     const snapshot = await readAllTextFiles(workspaceDir);
+    if (cancelled()) return;
     const gitDiff = await computeWorkspaceGitDiff(workspaceDir);
     const fileStatuses = await getWorkspaceFileStatuses(workspaceDir);
+    if (cancelled()) return;
 
     if (task.action === 'create') {
       createdCount++;
@@ -483,9 +501,10 @@ export async function runAutonomousFeatureBuild(params: {
         diagnosticIds: [],
       });
     }
-    await sleep(Math.round(360 * mult));
+    await delay(Math.round(360 * mult));
   }
 
+  if (cancelled()) return;
   for (const a of agents) {
     a.status = 'verifying';
     a.task = 'Checking tsc & tests…';
@@ -498,7 +517,9 @@ export async function runAutonomousFeatureBuild(params: {
     message: 'Running real tsc --noEmit and tsx --test across built workspace…',
   });
 
+  if (cancelled()) return;
   let finalFiles = await readAllTextFiles(workspaceDir);
+  if (cancelled()) return;
   let finalDebug = await runParallelDebugSwarm(workspaceDir, finalFiles.fileContents, false);
 
   const touchedTsErrors = finalDebug.diagnostics.filter(
@@ -520,6 +541,7 @@ export async function runAutonomousFeatureBuild(params: {
     const verifierAgent = agents[agents.length - 1];
     let repairedAny = false;
     for (const [fp, errMsgs] of byTouchedFile.entries()) {
+      if (cancelled()) return;
       const cur = finalFiles.fileContents[fp];
       if (!cur) continue;
       verifierAgent.status = 'editing';
@@ -531,16 +553,20 @@ export async function runAutonomousFeatureBuild(params: {
         agent: { ...verifierAgent },
         logLine: `[${verifierAgent.name}] Auto-repairing ${fp}: ${errMsgs[0]}`,
       });
-      await sleep(Math.round(450 * mult));
+      await delay(Math.round(450 * mult));
+      if (cancelled()) return;
 
       const fixedContent = await repairFileWithGemini(ai, fp, cur, errMsgs.join('\n'));
+      if (cancelled()) return;
       if (fixedContent && fixedContent !== cur) {
         await writeWorkspaceFile(workspaceDir, fp, fixedContent);
+        if (cancelled()) return;
         repairedAny = true;
         const [gitDiff, fileStatuses] = await Promise.all([
           computeWorkspaceGitDiff(workspaceDir),
           getWorkspaceFileStatuses(workspaceDir),
         ]);
+        if (cancelled()) return;
         const fixedLines = fixedContent.split(/\r?\n/);
         emit({
           type: 'file:patched',
@@ -559,13 +585,17 @@ export async function runAutonomousFeatureBuild(params: {
       }
     }
     if (repairedAny) {
+      if (cancelled()) return;
       finalFiles = await readAllTextFiles(workspaceDir);
+      if (cancelled()) return;
       finalDebug = await runParallelDebugSwarm(workspaceDir, finalFiles.fileContents, false);
     }
   }
 
+  if (cancelled()) return;
   const finalDiff = await computeWorkspaceGitDiff(workspaceDir);
   const finalStatuses = await getWorkspaceFileStatuses(workspaceDir);
+  if (cancelled()) return;
 
   for (const a of agents) {
     a.status = 'done';

@@ -28,6 +28,7 @@ interface EditorPaneProps {
   cursorAgents: CursorAgentState[];
   streamingFiles: Record<string, boolean>;
   selectedDiagId: string | null;
+  revealTarget?: { filePath: string; line: number; column: number; nonce: number } | null;
   onFocusPane: () => void;
   onSelectFile: (filePath: string) => void;
   onCloseTab: (filePath: string) => void;
@@ -53,6 +54,7 @@ export function EditorPane({
   cursorAgents,
   streamingFiles,
   selectedDiagId,
+  revealTarget,
   onFocusPane,
   onSelectFile,
   onCloseTab,
@@ -67,6 +69,7 @@ export function EditorPane({
 }: EditorPaneProps) {
   const [isEditingManual, setIsEditingManual] = useState(false);
   const [manualDraft, setManualDraft] = useState('');
+  const [flashLine, setFlashLine] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const activeTabRef = useRef<HTMLDivElement | null>(null);
 
@@ -126,7 +129,37 @@ export function EditorPane({
     }
   }, [activeFilePath, primaryCursor?.line, selectedDiagId, fileDiagnostics]);
 
-  const breadcrumbs = activeFilePath ? activeFilePath.split('/') : ['Welcome'];
+  useEffect(() => {
+    if (!revealTarget || revealTarget.filePath !== activeFilePath || isEditingManual) return;
+    const lineNum = revealTarget.line;
+    setFlashLine(lineNum);
+    const timer = window.setTimeout(() => {
+      setFlashLine((cur) => (cur === lineNum ? null : cur));
+    }, 1200);
+
+    const raf = window.requestAnimationFrame(() => {
+      const container = scrollRef.current;
+      if (!container) return;
+      const lineEl = container.querySelector<HTMLElement>(`[data-line="${lineNum}"]`);
+      if (!lineEl) return;
+      const top = lineEl.offsetTop;
+      const visibleTop = container.scrollTop;
+      const visibleBottom = visibleTop + container.clientHeight;
+      if (top < visibleTop + 32 || top > visibleBottom - 64) {
+        container.scrollTo({
+          top: Math.max(0, top - Math.round(container.clientHeight * 0.35)),
+          behavior: 'smooth',
+        });
+      }
+    });
+
+    return () => {
+      window.clearTimeout(timer);
+      window.cancelAnimationFrame(raf);
+    };
+  }, [revealTarget?.nonce, revealTarget?.filePath, revealTarget?.line, activeFilePath, isEditingManual]);
+
+  const breadcrumbs = activeFilePath ? activeFilePath.split('/') : [];
 
   const handleMinimapClick = (ratio: number) => {
     if (!scrollRef.current) return;
@@ -177,12 +210,23 @@ export function EditorPane({
               <div
                 key={tabPath}
                 ref={isActive ? activeTabRef : undefined}
+                role="button"
+                tabIndex={0}
+                aria-label={`Open ${fileName}`}
                 onClick={(e) => {
                   e.stopPropagation();
                   onFocusPane();
                   onSelectFile(tabPath);
                 }}
-                className={`group h-[35px] flex items-center gap-1.5 pl-2.5 pr-2 border-r border-[#252526] text-[13px] cursor-pointer shrink-0 transition-colors ${
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onFocusPane();
+                    onSelectFile(tabPath);
+                  }
+                }}
+                className={`group h-[35px] flex items-center gap-1.5 pl-2.5 pr-2 border-r border-[#252526] text-[13px] cursor-pointer shrink-0 transition-colors outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[#007acc] ${
                   isActive
                     ? `bg-[#1e1e1e] ${isFocused ? 'border-t border-t-[#007acc]' : 'border-t border-t-transparent'}`
                     : 'bg-[#2d2d2d] hover:bg-[#2a2d2e] border-t border-t-transparent'
@@ -228,7 +272,8 @@ export function EditorPane({
                     e.stopPropagation();
                     onCloseTab(tabPath);
                   }}
-                  className={`ml-0.5 p-0.5 rounded hover:bg-[#ffffff]/10 text-[#969696] hover:text-[#ffffff] ${isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}
+                  onKeyDown={(e) => e.stopPropagation()}
+                  className={`ml-0.5 p-0.5 rounded hover:bg-[#ffffff]/10 text-[#969696] hover:text-[#ffffff] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#007acc] ${isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'}`}
                 >
                   <X className="w-3.5 h-3.5" strokeWidth={1.75} aria-hidden="true" />
                 </button>
@@ -314,16 +359,20 @@ export function EditorPane({
       </div>
 
       {/* Breadcrumbs Bar */}
-      <div className="h-[22px] px-3 bg-[#1e1e1e] flex items-center justify-between gap-3 text-[12px] text-[#969696] shrink-0 border-b border-[#1e1e1e]">
+      <div className="h-[22px] px-3 bg-[#1e1e1e] flex items-center justify-between gap-3 text-[12px] text-[#969696] shrink-0 border-b border-[#2b2b2b]">
         <div className="flex items-center gap-0.5 min-w-0 truncate">
-          {breadcrumbs.map((seg, i) => (
-            <span key={`${seg}-${i}`} className="flex items-center gap-0.5 min-w-0">
-              {i > 0 && <ChevronRight className="w-3.5 h-3.5 text-[#6a6a6a] shrink-0" strokeWidth={1.5} aria-hidden="true" />}
-              <span className={i === breadcrumbs.length - 1 ? 'text-[#cccccc]' : 'hover:text-[#cccccc] cursor-pointer'}>
-                {seg}
+          {breadcrumbs.length === 0 ? (
+            <span className="text-[#6a6a6a]"> </span>
+          ) : (
+            breadcrumbs.map((seg, i) => (
+              <span key={`${seg}-${i}`} className="flex items-center gap-0.5 min-w-0">
+                {i > 0 && <ChevronRight className="w-3.5 h-3.5 text-[#6a6a6a] shrink-0" strokeWidth={1.5} aria-hidden="true" />}
+                <span className={i === breadcrumbs.length - 1 ? 'text-[#cccccc]' : 'text-[#969696]'}>
+                  {seg}
+                </span>
               </span>
-            </span>
-          ))}
+            ))
+          )}
         </div>
 
         <span className="inline-flex items-center gap-2 text-[11px] truncate shrink-0">
@@ -395,7 +444,9 @@ export function EditorPane({
                 const hasFold = /\{\s*$/.test(lineText);
 
                 let rowBg = '';
-                if (isWritingHere || lineCursors.some((c) => c.status === 'writing' || c.status === 'editing')) {
+                if (flashLine === lineNum) {
+                  rowBg = 'bg-[#094771]/55';
+                } else if (isWritingHere || lineCursors.some((c) => c.status === 'writing' || c.status === 'editing')) {
                   rowBg = 'bg-[#264f78]/30';
                 } else if (lineCursors.length > 0) {
                   rowBg = 'bg-[#2a2d2e]/60';

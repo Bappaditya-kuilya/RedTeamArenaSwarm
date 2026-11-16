@@ -163,6 +163,7 @@ app.post('/api/repo/:workspaceId/swarm-fix', async (req, res) => {
     closed = true;
   });
 
+  const isClosed = () => closed;
   try {
     await runAutonomousSwarmFix({
       workspaceId: meta.workspaceId,
@@ -170,6 +171,7 @@ app.post('/api/repo/:workspaceId/swarm-fix', async (req, res) => {
       agentCount,
       speed: parseSpeed(speed),
       useAi,
+      isCancelled: isClosed,
       emit: (event) => {
         if (!closed) {
           res.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -216,6 +218,7 @@ app.post('/api/repo/:workspaceId/composer', async (req, res) => {
     closed = true;
   });
 
+  const isClosed = () => closed;
   try {
     await runAutonomousFeatureBuild({
       workspaceId: meta.workspaceId,
@@ -224,6 +227,7 @@ app.post('/api/repo/:workspaceId/composer', async (req, res) => {
       agentCount,
       speed: parseSpeed(speed),
       useAi,
+      isCancelled: isClosed,
       emit: (event) => {
         if (!closed) {
           res.write(`data: ${JSON.stringify(event)}\n\n`);

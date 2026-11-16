@@ -297,9 +297,15 @@ export async function runAutonomousSwarmFix(params: {
   agentCount?: number;
   speed?: CursorSpeed;
   useAi?: boolean;
+  isCancelled?: () => boolean;
   emit: (event: SwarmStreamEvent) => void;
 }): Promise<void> {
-  const { workspaceId, workspaceDir, useAi = true, speed = 'slow', emit } = params;
+  const { workspaceId, workspaceDir, useAi = true, speed = 'slow', emit, isCancelled } = params;
+  const cancelled = () => Boolean(isCancelled?.());
+  const delay = async (ms: number) => {
+    if (cancelled()) return;
+    await sleep(ms);
+  };
   const mult = SPEED_MULTIPLIER[speed] ?? 1.0;
   const numAgents = 10;
 
@@ -323,6 +329,7 @@ export async function runAutonomousSwarmFix(params: {
     }
   };
 
+  if (cancelled()) return;
   broadcast();
   emit({
     type: 'phase',
@@ -331,7 +338,9 @@ export async function runAutonomousSwarmFix(params: {
   });
 
   const initialFiles = await readAllTextFiles(workspaceDir);
+  if (cancelled()) return;
   const initialDebug = await runParallelDebugSwarm(workspaceDir, initialFiles.fileContents, useAi);
+  if (cancelled()) return;
   const tsFiles = Object.keys(initialFiles.fileContents).filter(
     (p) => /\.(ts|tsx)$/i.test(p) && !p.endsWith('.d.ts')
   );
@@ -362,7 +371,9 @@ export async function runAutonomousSwarmFix(params: {
       a.task = '0 issues to fix · Workspace clean';
     }
     broadcast(`[Swarm] Codebase verified clean — 0 issues remaining.`);
+    if (cancelled()) return;
     const gitDiff = await computeWorkspaceGitDiff(workspaceDir);
+    if (cancelled()) return;
     emit({
       type: 'swarm:complete',
       result: { workspaceId, ...initialDebug, gitDiff },
@@ -386,6 +397,7 @@ export async function runAutonomousSwarmFix(params: {
 
   // Strictly per-file sequential: all agents converge on the same active file, animate in-file work, then move together.
   for (let fIdx = 0; fIdx < fileQueues.length; fIdx++) {
+    if (cancelled()) return;
     const job = fileQueues[fIdx];
     let currentContent = initialFiles.fileContents[job.filePath];
     if (currentContent === undefined) continue;
@@ -405,6 +417,7 @@ export async function runAutonomousSwarmFix(params: {
     }
     const convergeFrom = agents.map((a) => a.line || 1);
     for (let step = 1; step <= 3; step++) {
+      if (cancelled()) return;
       for (let i = 0; i < agents.length; i++) {
         const from = convergeFrom[i];
         const to = assignedLines[i];
@@ -413,25 +426,29 @@ export async function runAutonomousSwarmFix(params: {
         agents[i].status = step < 3 ? 'navigating' : 'scanning';
       }
       broadcast(`[Swarm ${fIdx + 1}/${fileQueues.length}] All ${numAgents} cursors converged on ${job.filePath}`);
-      await sleep(Math.round(120 * mult));
+      await delay(Math.round(120 * mult));
     }
 
     const snapshotBeforeFile = currentContent;
+    if (cancelled()) return;
     const baselineTscErrors = tsFiles.includes(job.filePath)
       ? await countFileTscErrors(workspaceDir, tsFiles, job.filePath)
       : 0;
+    if (cancelled()) return;
     const baselineTest = isTestFilePath(job.filePath)
       ? await runTargetedTestCheck(workspaceDir, job.filePath)
       : { ran: false, failed: 0, exitCode: 0 };
     const patchedIdsInFile: Array<{ id: string; agentId: string }> = [];
 
     for (let dIdx = 0; dIdx < job.items.length; dIdx++) {
+      if (cancelled()) return;
       const diag = job.items[dIdx];
       const writerIndex = dIdx % numAgents;
       const writer = agents[writerIndex];
 
       const writerFromLine = writer.line || 1;
       for (let step = 1; step <= 2; step++) {
+        if (cancelled()) return;
         for (let i = 0; i < agents.length; i++) {
           const a = agents[i];
           a.filePath = job.filePath;
@@ -448,7 +465,7 @@ export async function runAutonomousSwarmFix(params: {
               : `Scanning ${job.filePath} while ${writer.name} targets ${diag.code}`;
         }
         broadcast(`[${writer.name}] → ${job.filePath}:${diag.line} [${diag.code}] ${diag.title}`);
-        await sleep(Math.round(140 * mult));
+        await delay(Math.round(140 * mult));
       }
       for (let i = 0; i < agents.length; i++) {
         const a = agents[i];
@@ -503,6 +520,7 @@ export async function runAutonomousSwarmFix(params: {
         if (beforeLine !== resolvedAfterLine) {
           const frames = Math.max(8, Math.min(20, Math.ceil(resolvedAfterLine.length / 4) + 6));
           for (let step = 1; step <= frames; step++) {
+            if (cancelled()) return;
             const charCount = Math.max(1, Math.floor((resolvedAfterLine.length * step) / frames));
             const partialLine = resolvedAfterLine.slice(0, charCount);
             writer.status = 'writing';
@@ -531,12 +549,14 @@ export async function runAutonomousSwarmFix(params: {
               content: partialContent,
               action: 'modify',
             });
-            await sleep(Math.round((35 + Math.min(40, resolvedAfterLine.length)) * mult));
+            await delay(Math.round((35 + Math.min(40, resolvedAfterLine.length)) * mult));
           }
 
+          if (cancelled()) return;
           liveLines[diag.line - 1] = resolvedAfterLine;
           const nextContent = liveLines.join('\n');
           await writeWorkspaceFile(workspaceDir, job.filePath, nextContent);
+          if (cancelled()) return;
           currentContent = nextContent;
           patchedIdsInFile.push({ id: diag.id, agentId: writer.id });
           writer.fixedCount += 1;
@@ -548,6 +568,7 @@ export async function runAutonomousSwarmFix(params: {
             computeWorkspaceGitDiff(workspaceDir),
             getWorkspaceFileStatuses(workspaceDir),
           ]);
+          if (cancelled()) return;
           for (const a of agents) if (a !== writer) { a.status = 'scanning'; a.task = `Scanning ${job.filePath} after patch`; }
           broadcast();
           emit({
@@ -564,11 +585,12 @@ export async function runAutonomousSwarmFix(params: {
             fileStatuses,
             diagnosticIds: [diag.id],
           });
-          await sleep(Math.round(220 * mult));
+          await delay(Math.round(220 * mult));
         }
       }
 
       for (let step = 1; step <= 3; step++) {
+        if (cancelled()) return;
         for (let i = 0; i < agents.length; i++) {
           const a = agents[i];
           a.status = 'verifying';
@@ -579,12 +601,13 @@ export async function runAutonomousSwarmFix(params: {
           a.task = `Verifying ${job.filePath}:${a.line}`;
         }
         broadcast();
-        await sleep(Math.round(70 * mult));
+        await delay(Math.round(70 * mult));
       }
     }
 
     if (patchedIdsInFile.length > 0) {
       for (let step = 1; step <= 3; step++) {
+        if (cancelled()) return;
         for (let i = 0; i < agents.length; i++) {
           const a = agents[i];
           a.status = 'verifying';
@@ -595,8 +618,9 @@ export async function runAutonomousSwarmFix(params: {
           a.task = `Verifying checks on ${job.filePath}…`;
         }
         broadcast(`[Swarm] Verifying ${job.filePath} with real checks…`);
-        await sleep(Math.round(80 * mult));
+        await delay(Math.round(80 * mult));
       }
+      if (cancelled()) return;
       let revertReason = '';
       if (tsFiles.includes(job.filePath)) {
         const afterTscErrors = await countFileTscErrors(workspaceDir, tsFiles, job.filePath);
@@ -604,14 +628,17 @@ export async function runAutonomousSwarmFix(params: {
           revertReason = `tsc errors increased ${baselineTscErrors} → ${afterTscErrors}`;
         }
       }
+      if (cancelled()) return;
       if (!revertReason && isTestFilePath(job.filePath)) {
         const afterTest = await runTargetedTestCheck(workspaceDir, job.filePath);
         if (afterTest.ran && (afterTest.failed > baselineTest.failed || (!baselineTest.ran && afterTest.exitCode !== 0))) {
           revertReason = `test checks regressed (${baselineTest.failed} → ${afterTest.failed} failures)`;
         }
       }
+      if (cancelled()) return;
       if (revertReason) {
         await writeWorkspaceFile(workspaceDir, job.filePath, snapshotBeforeFile);
+        if (cancelled()) return;
         const revertedDiff = await computeWorkspaceGitDiff(workspaceDir);
         for (const p of patchedIdsInFile) {
           const ag = agents.find((a) => a.id === p.agentId);
@@ -634,6 +661,7 @@ export async function runAutonomousSwarmFix(params: {
     }
   }
 
+  if (cancelled()) return;
   for (const a of agents) {
     a.status = 'verifying';
     a.diagnosticId = null;
@@ -649,6 +677,7 @@ export async function runAutonomousSwarmFix(params: {
 
   let hbTick = 0;
   const finalHb = setInterval(() => {
+    if (cancelled()) return;
     hbTick++;
     for (let i = 0; i < agents.length; i++) {
       const a = agents[i];
@@ -663,7 +692,9 @@ export async function runAutonomousSwarmFix(params: {
   let finalFiles, finalDebug, finalDiff, finalStatuses;
   try {
     finalFiles = await readAllTextFiles(workspaceDir);
+    if (cancelled()) return;
     finalDebug = await runParallelDebugSwarm(workspaceDir, finalFiles.fileContents, false);
+    if (cancelled()) return;
     [finalDiff, finalStatuses] = await Promise.all([
       computeWorkspaceGitDiff(workspaceDir),
       getWorkspaceFileStatuses(workspaceDir),
@@ -671,6 +702,7 @@ export async function runAutonomousSwarmFix(params: {
   } finally {
     clearInterval(finalHb);
   }
+  if (cancelled() || !finalFiles || !finalDebug || finalDiff == null || !finalStatuses) return;
 
   const remainingErrors = finalDebug.diagnostics.filter((d) => d.severity === 'error').length;
   const evidence = `verified=${verifiedFixCount} reverted=${revertedFixCount} open=${finalDebug.diagnostics.length} openErrors=${remainingErrors} tscErrors=${finalDebug.tscResult.errorCount} testsFailed=${finalDebug.testResult.failed}`;

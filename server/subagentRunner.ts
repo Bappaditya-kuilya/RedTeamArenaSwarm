@@ -59,9 +59,17 @@ async function runSecuritySubagent(
     if (!['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.html'].includes(ext)) {
       continue;
     }
+    const lines = code.split(/\r?\n/);
     const matches = scanSourceCode(code, filePath);
     for (const m of matches) {
-      const matchedLine = code.split(/\r?\n/)[m.line - 1] ?? m.matchedLine;
+      const matchedLine = lines[m.line - 1] ?? m.matchedLine;
+      const patch = m.patchedLine;
+      const functionalPatch =
+        matchedLine !== undefined &&
+        patch !== matchedLine &&
+        !patch.trim().startsWith('//') &&
+        !/^\/\*[\s\S]*\*\/$/.test(patch.trim()) &&
+        !(/TODO|FIXME/i.test(patch) && /\/[/*]/.test(patch));
       diagnostics.push({
         id: `sec-${filePath}-${m.line}-${m.ruleId}`,
         source: 'security',
@@ -76,7 +84,7 @@ async function runSecuritySubagent(
         agentName: 'Sec · Audit-Prober',
         agentColor: '#F24822',
         originalLine: matchedLine,
-        suggestedLinePatch: m.patchedLine,
+        suggestedLinePatch: functionalPatch ? patch : undefined,
         explanation: `Evidence: rule ${m.ruleId} (${m.cwe}) matched ${filePath}:${m.line}${matchedLine ? `: ${matchedLine.trim()}` : ''}. ${m.remediation}`,
         fixed: false,
       });
