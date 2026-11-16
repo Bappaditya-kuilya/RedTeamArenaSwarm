@@ -103,31 +103,33 @@ function getWorkTarget(
   const baseY = lineRect.top - containerRect.top + lineRect.height * 0.52;
 
   const p = tSec * 2.1 + slotIdx * 0.83;
-  let ox = (slotIdx - 4.5) * 3.2;
-  let oy = ((slotIdx % 3) - 1) * 2.2;
-  let press = 0.04;
+  let ox = (slotIdx - 4.5) * 1.4;
+  let oy = ((slotIdx % 3) - 1) * 1.0;
+  let press = 0.03;
 
   if (status === 'scanning') {
-    ox += Math.sin(p * 0.6) * 5;
-    oy += Math.cos(p * 0.5 + slotIdx) * 3;
-    press = 0.05 + 0.04 * Math.max(0, Math.sin(p * 0.8));
+    // Precise scan: gentle horizontal sweep near target, minimal jitter
+    ox += Math.sin(p * 0.7) * 1.8;
+    oy += Math.cos(p * 0.35 + slotIdx) * 0.8;
+    press = 0.03 + 0.03 * Math.max(0, Math.sin(p * 0.9));
   } else if (status === 'navigating') {
-    ox += Math.sin(p * 0.9) * 4;
-    oy += Math.cos(p * 1.0) * 2;
-    press = 0.07;
+    ox += Math.sin(p * 0.8) * 1.2;
+    oy += Math.cos(p * 0.9) * 0.6;
+    press = 0.04;
   } else if (status === 'writing' || status === 'editing') {
-    ox += Math.sin(p * 2.4) * 1.5;
-    oy += Math.sin(p * 3.8) * 0.8;
-    press = 0.32 + 0.48 * Math.max(0, Math.sin(p * 5.4 + slotIdx * 0.22));
+    // Precise typing: stay on the caret/target with tiny micro-movement and clear keypress pulse
+    ox += Math.sin(p * 1.8) * 0.35;
+    oy += Math.sin(p * 2.6) * 0.2;
+    press = 0.18 + 0.42 * Math.max(0, Math.sin(p * 6.2 + slotIdx * 0.18));
   } else if (status === 'verifying') {
-    ox += Math.sin(p * 0.5) * 4;
-    oy += Math.cos(p * 0.45) * 2;
-    press = 0.1 + 0.05 * Math.max(0, Math.sin(p * 1.1));
+    ox += Math.sin(p * 0.45) * 1.2;
+    oy += Math.cos(p * 0.4) * 0.6;
+    press = 0.05 + 0.03 * Math.max(0, Math.sin(p * 1.0));
   } else {
-    // fallback: show as active typing/scanning, never standing still
-    ox += Math.sin(p * 2.2) * 2;
-    oy += Math.sin(p * 3.4) * 1;
-    press = 0.25 + 0.35 * Math.max(0, Math.sin(p * 4.8 + slotIdx * 0.2));
+    // subtle idle-at-work presence, no erratic motion
+    ox += Math.sin(p * 0.6) * 0.6;
+    oy += Math.cos(p * 0.5) * 0.4;
+    press = 0.04 + 0.02 * Math.max(0, Math.sin(p * 1.2 + slotIdx * 0.2));
   }
 
   const x = clamp(baseX + ox, relPane.left + 28, relPane.left + relPane.width - 20);
@@ -280,50 +282,55 @@ export function SwarmCursorsOverlay({
         let targetCol = Math.max(1, effectiveAgent?.column ?? 1);
 
         if (workingNow) {
-          // If agent is idle/done/stuck with no updates, assign synthetic active work so it looks like writing/fixing
-          const syntheticBaseLine = Math.max(1, (currentAgents.find((a) => ACTIVE_STATUSES.has(a.status))?.line ?? targetLine));
+          // Keep helpers near real work, but move precisely (no wide synthetic sweeps)
+          const anchor = currentAgents.find((a) => ACTIVE_STATUSES.has(a.status) && a.filePath === activeFileRef.current)
+            ?? currentAgents.find((a) => ACTIVE_STATUSES.has(a.status))
+            ?? effectiveAgent;
+          const anchorLine = Math.max(1, anchor?.line ?? targetLine);
+          const anchorCol = Math.max(1, anchor?.column ?? targetCol);
           if (!effectiveAgent || !isWorkStatus) {
-            // cycle through "helping" roles: some write/type, some scan nearby lines
-            const role = idx % 3;
-            const sweep = (tSec * (0.35 + (idx % 4) * 0.07) + idx * 0.9);
-            targetLine = Math.max(1, syntheticBaseLine + ((idx % 7) - 3) + Math.floor(Math.sin(sweep) * 2));
-            targetCol = 8 + ((idx * 9 + Math.floor(tSec * (role === 0 ? 10 : 5))) % 55);
+            // helper cursors: hold nearby positions with subtle, purposeful motion
+            const lane = (idx % 5) - 2;
+            targetLine = Math.max(1, anchorLine + lane);
+            targetCol = Math.max(1, anchorCol + (idx % 3) - 1);
           } else {
-            // keep reported target but ensure continuous progress
+            // trust reported targets for actual working agents
             targetLine = Math.max(1, targetLine);
             targetCol = Math.max(1, targetCol);
           }
         }
 
         const lineDiff = targetLine - sim.animLine;
-        sim.animLine += clamp(lineDiff, -dt * (workingNow ? 14 : 18), dt * (workingNow ? 14 : 18));
-        if (Math.abs(lineDiff) > 0.6) {
-          sim.animCol += (2 - sim.animCol) * Math.min(1, dt * 6);
+        sim.animLine += clamp(lineDiff, -dt * (workingNow ? 10 : 18), dt * (workingNow ? 10 : 18));
+        if (Math.abs(lineDiff) > 0.5) {
+          sim.animCol += (targetCol - sim.animCol) * Math.min(1, dt * 5);
         }
 
         const colDiff = targetCol - sim.animCol;
         if (workingNow && (!isWorkStatus || status === 'navigating')) {
-          // synthetic/helper typing motion - looks like actively writing/fixing
-          const typeRate = 8 + (idx % 5) * 1.5;
-          if (Math.abs(colDiff) > 0.3) sim.animCol += clamp(colDiff, -dt * 18, dt * 18);
-          sim.animCol += dt * typeRate * (0.55 + 0.45 * Math.max(0, Math.sin(tSec * 5.2 + idx * 0.7)));
-          if (sim.animCol > 70) sim.animCol = 6 + (idx % 8);
+          // helper: small, precise adjustments (no fast looping across the line)
+          if (Math.abs(colDiff) > 0.15) sim.animCol += clamp(colDiff, -dt * 10, dt * 10);
+          sim.animCol += Math.sin(tSec * 1.6 + idx) * dt * 0.25;
         } else if (status === 'writing' || status === 'editing') {
-          const typeRate = 10 * speedFactor;
-          if (colDiff > 0.2) sim.animCol += Math.min(colDiff, dt * (12 + colDiff * 6));
-          else sim.animCol += dt * typeRate * (0.6 + 0.4 * Math.max(0, Math.sin(tSec * 6 + idx)));
-          if (workingNow && Math.abs(colDiff) < 0.25) sim.animCol += dt * typeRate * 0.35; // never stand still while writing
+          // typing: smooth advance toward target column, then tiny caret pulse
+          const typeRate = 8 * speedFactor;
+          if (Math.abs(colDiff) > 0.12) {
+            sim.animCol += clamp(colDiff, -dt * (10 + Math.min(18, Math.abs(colDiff) * 4)), dt * (10 + Math.min(18, Math.abs(colDiff) * 4)));
+          } else {
+            sim.animCol += Math.sin(tSec * 5.5 + idx) * dt * 0.18;
+          }
+          if (workingNow && Math.abs(colDiff) < 0.2) sim.animCol += dt * typeRate * 0.08; // subtle progress, not sweeping
         } else if (status === 'scanning') {
-          if (Math.abs(colDiff) > 0.2) sim.animCol += clamp(colDiff, -dt * 20, dt * 20);
-          sim.animCol += dt * (workingNow ? 5 : 3) * (0.5 + 0.5 * Math.sin(tSec * 1.2 + idx));
+          if (Math.abs(colDiff) > 0.15) sim.animCol += clamp(colDiff, -dt * 14, dt * 14);
+          sim.animCol += Math.sin(tSec * 1.1 + idx) * dt * 0.5;
         } else if (status === 'verifying') {
-          if (Math.abs(colDiff) > 0.2) sim.animCol += clamp(colDiff, -dt * 16, dt * 16);
-          sim.animCol += dt * (workingNow ? 3.5 : 1.5) * (0.5 + 0.5 * Math.sin(tSec * 1.4 + idx));
+          if (Math.abs(colDiff) > 0.15) sim.animCol += clamp(colDiff, -dt * 12, dt * 12);
+          sim.animCol += Math.sin(tSec * 0.9 + idx) * dt * 0.35;
         } else {
           if (workingNow) {
-            // any other state during active task: keep moving like writing/scanning
-            sim.animCol += dt * (6 + (idx % 4)) * (0.5 + 0.5 * Math.max(0, Math.sin(tSec * 4.8 + idx)));
-            if (sim.animCol > 65) sim.animCol = 5 + (idx % 10);
+            // calm presence near target
+            if (Math.abs(colDiff) > 0.2) sim.animCol += clamp(colDiff, -dt * 8, dt * 8);
+            sim.animCol += Math.sin(tSec * 0.8 + idx) * dt * 0.2;
           } else {
             sim.animCol += clamp(colDiff, -dt * 16, dt * 16);
           }
@@ -363,10 +370,10 @@ export function SwarmCursorsOverlay({
         let dvx = 0;
         let dvy = 0;
         if (hasActiveWork) {
-          // Purposeful work motion: move directly to task target (like building/fixing), minimal orbit/roam
-          const workDesiredDist = 10 + (idx % 3) * 3;
-          const radial = clamp((workDesiredDist - dist) * 7, -3200, 2200);
-          const tangential = Math.sin(tSec * 1.6 + sim.phase) * 18 * speedFactor;
+          // Precise work motion: strong attraction to exact target, minimal orbit/roam
+          const workDesiredDist = 4 + (idx % 3) * 1.5;
+          const radial = clamp((workDesiredDist - dist) * 10, -4200, 3200);
+          const tangential = Math.sin(tSec * 0.9 + sim.phase) * 4 * speedFactor;
           dvx = nx * radial - ny * tangential;
           dvy = ny * radial + nx * tangential;
         } else {
@@ -405,9 +412,9 @@ export function SwarmCursorsOverlay({
         let ax = desired[i].x;
         let ay = desired[i].y;
         if (neighbors > 0) {
-          // In work mode stay goal-directed; in idle keep flock cohesion
-          const targetW = hasActiveWork ? 0.92 : 0.7;
-          const neighW = hasActiveWork ? 0.08 : 0.3;
+          // In work mode stay goal-directed and precise; in idle keep flock cohesion
+          const targetW = hasActiveWork ? 0.97 : 0.7;
+          const neighW = hasActiveWork ? 0.03 : 0.3;
           ax = ax * targetW + (avx / neighbors) * neighW;
           ay = ay * targetW + (avy / neighbors) * neighW;
         }
@@ -421,16 +428,18 @@ export function SwarmCursorsOverlay({
           ? getWorkTarget(container, activeFileRef.current, boostAgent, i, tSec, sim.animLine, sim.animCol, true) ?? lissajous
           : pointer ?? lissajous;
         const away = Math.max(0, Math.hypot(sim.x - targetForBoost.x, sim.y - targetForBoost.y) - 180);
-        const maxSpeed = sim.speed * speedFactor * (1.25 + Math.min(3.0, away / 90));
+        const speedBoost = hasActiveWork ? (1.0 + Math.min(1.2, away / 140)) : (1.25 + Math.min(3.0, away / 90));
+        const maxSpeed = sim.speed * speedFactor * speedBoost;
         const speedMag = Math.hypot(ax, ay);
         if (speedMag > maxSpeed) {
           ax *= maxSpeed / speedMag;
           ay *= maxSpeed / speedMag;
         }
 
-        let steerX = (ax - sim.vx) * 6;
-        let steerY = (ay - sim.vy) * 6;
-        const maxForce = sim.force * speedFactor * (1.3 + Math.min(4.5, away / 55));
+        let steerX = (ax - sim.vx) * (hasActiveWork ? 8 : 6);
+        let steerY = (ay - sim.vy) * (hasActiveWork ? 8 : 6);
+        const forceBoost = hasActiveWork ? (1.1 + Math.min(2.0, away / 80)) : (1.3 + Math.min(4.5, away / 55));
+        const maxForce = sim.force * speedFactor * forceBoost;
         const steerMag = Math.hypot(steerX, steerY);
         if (steerMag > maxForce) {
           steerX *= maxForce / steerMag;
@@ -439,6 +448,11 @@ export function SwarmCursorsOverlay({
 
         sim.vx += steerX * dt;
         sim.vy += steerY * dt;
+        if (hasActiveWork) {
+          // damp overshoot near target for precise, "precious" cursor placement
+          sim.vx *= Math.exp(-dt * 2.2);
+          sim.vy *= Math.exp(-dt * 2.2);
+        }
         sim.x += sim.vx * dt;
         sim.y += sim.vy * dt;
 
