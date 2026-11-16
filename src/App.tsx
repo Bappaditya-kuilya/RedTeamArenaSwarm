@@ -56,6 +56,9 @@ function diagKey(d: Pick<CodeDiagnostic, 'source' | 'code' | 'filePath' | 'line'
   return [d.source, d.code, d.filePath, d.line, d.title, d.message].join('|');
 }
 
+const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, '') || '';
+const apiUrl = (path: string) => `${API_BASE}${path}`;
+
 async function safeReadJson<T>(resp: Response): Promise<T | null> {
   const text = await resp.text();
   if (!text) return null;
@@ -581,7 +584,7 @@ export default function App() {
         `$ real-debug-scan tsc --noEmit && tsx --test && security-audit && bug-audit (${ws.repoName})`,
       ]);
       try {
-        const resp = await fetch(`/api/repo/${ws.workspaceId}/debug`, {
+        const resp = await fetch(apiUrl(`/api/repo/${ws.workspaceId}/debug`), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ useAi: false }),
@@ -1018,7 +1021,7 @@ export default function App() {
         if (isShowcaseWs(ws)) {
           await runShowcaseFix();
         } else {
-          const resp = await fetch(`/api/repo/${ws.workspaceId}/swarm-fix`, {
+          const resp = await fetch(apiUrl(`/api/repo/${ws.workspaceId}/swarm-fix`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ agentCount: fixedCount, speed, useAi: true }),
@@ -1121,7 +1124,7 @@ export default function App() {
         if (isShowcaseWs(ws)) {
           await runShowcaseBuild();
         } else {
-          const resp = await fetch(`/api/repo/${ws.workspaceId}/composer`, {
+          const resp = await fetch(apiUrl(`/api/repo/${ws.workspaceId}/composer`), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ prompt, agentCount: fixedCount, speed, useAi: true }),
@@ -1170,7 +1173,7 @@ export default function App() {
 
         if (payload.source === 'demo') {
           try {
-            const resp = await fetch('/api/repo/import', {
+            const resp = await fetch(apiUrl('/api/repo/import'), {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload),
@@ -1184,7 +1187,7 @@ export default function App() {
         } else {
           let parsed: (WorkspaceSnapshot & { error?: string }) | null = null;
           try {
-            const resp = await fetch('/api/repo/import', {
+            const resp = await fetch(apiUrl('/api/repo/import'), {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload),
@@ -1280,7 +1283,7 @@ export default function App() {
           openFileInPane(filePath, focusedPane);
           return;
         }
-        const resp = await fetch(`/api/repo/${workspace.workspaceId}/create-file`, {
+        const resp = await fetch(apiUrl(`/api/repo/${workspace.workspaceId}/create-file`), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filePath, content: `// ${filePath}\n` }),
@@ -1352,7 +1355,7 @@ export default function App() {
           setAgentOutputLogs((prev) => [...prev.slice(-180), `$ ${command}`, ...(output ? output.split('\n').slice(0, 12) : ['(no output)'])]);
           return;
         }
-        const resp = await fetch(`/api/repo/${workspace.workspaceId}/run-command`, {
+        const resp = await fetch(apiUrl(`/api/repo/${workspace.workspaceId}/run-command`), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ command }),
@@ -1473,7 +1476,7 @@ export default function App() {
           applyShowcaseLocal();
           return;
         }
-        const resp = await fetch(`/api/repo/${workspace.workspaceId}/apply-fix`, {
+        const resp = await fetch(apiUrl(`/api/repo/${workspace.workspaceId}/apply-fix`), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1548,7 +1551,7 @@ export default function App() {
         await runScanOnWorkspace(nextWs);
         return;
       }
-      const resp = await fetch(`/api/repo/${workspace.workspaceId}/reset`, { method: 'POST' });
+      const resp = await fetch(apiUrl(`/api/repo/${workspace.workspaceId}/reset`), { method: 'POST' });
       const data = await safeReadJson<{
         files: WorkspaceSnapshot['files'];
         fileContents: Record<string, string>;
